@@ -1,3 +1,3 @@
 fn main() {
-    println!("cachekit-cli {}", env!("CARGO_PKG_VERSION"));
+    println!("cachekit-cli {} {}", env!("CARGO_PKG_VERSION"), "/api/admin");
 }
