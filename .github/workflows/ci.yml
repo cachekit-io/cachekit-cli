@@ -10,7 +10,6 @@ permissions:
   contents: read
 
 env:
-  CARGO_TERM_COLOR: always
   # This CLI calls user-scoped endpoints only. Any reference to the
   # platform-admin API in the source or the built binary fails the build.
   ADMIN_API_PATTERN: "/api/admin|platform-admins|flagship"
@@ -29,7 +28,7 @@ jobs:
           # git grep exits 0 on a match, 1 on none, and anything else on error.
           # This file holds the pattern, so it is the one path excluded.
           rc=0
-          git grep --text -nE "$ADMIN_API_PATTERN" -- ':!.github/workflows/ci.yml' || rc=$?
+          git grep --text -niE "$ADMIN_API_PATTERN" -- ':!.github/workflows/ci.yml' || rc=$?
           if [ "$rc" -eq 0 ]; then
             echo "::error::admin API reference found in the source"
             exit 1
@@ -37,6 +36,20 @@ jobs:
             echo "::error::git grep failed with exit code $rc"
             exit "$rc"
           fi
+
+      - name: Dependencies come from crates.io only
+        run: |
+          # cargo-deny misses both of these. A committed Cargo config can
+          # replace the crates.io source, and a path dependency that declares
+          # a version is not a wildcard.
+          configs=$(git ls-files -- ':(glob)**/.cargo/config' ':(glob)**/.cargo/config.toml')
+          if [ -n "$configs" ]; then
+            echo "::error::committed Cargo config found: $configs"
+            exit 1
+          fi
+          cargo metadata --locked --format-version 1 \
+            | jq -e '([.packages[] | select(.source == null) | .id] - .workspace_members) == []' > /dev/null \
+            || { echo "::error::path dependency outside the workspace"; exit 1; }
 
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
 
@@ -69,7 +82,7 @@ jobs:
         run: |
           # grep exits 0 on a match, 1 on none, and 2 on error (a missing binary included).
           rc=0
-          grep -aoE "$ADMIN_API_PATTERN" target/release/cachekit-cli || rc=$?
+          grep -aoiE "$ADMIN_API_PATTERN" target/release/cachekit-cli || rc=$?
           if [ "$rc" -eq 0 ]; then
             echo "::error::admin API reference found in the release binary"
             exit 1
