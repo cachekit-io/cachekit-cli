@@ -1,0 +1,14 @@
+# Dependencies come from crates.io and nowhere else. A path dependency has no
+# version, so `wildcards = "deny"` rejects one that points outside this crate.
+
+[licenses]
+allow = ["MIT", "Apache-2.0"]
+
+[bans]
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

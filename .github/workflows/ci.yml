@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # This CLI calls user-scoped endpoints only. Any reference to the
+  # platform-admin API in the source or the built binary fails the build.
+  ADMIN_API_PATTERN: "/api/admin|platform-admins|flagship"
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: No admin API references in the source
+        run: |
+          # git grep exits 0 on a match, 1 on none, and anything else on error.
+          # This file holds the pattern, so it is the one path excluded.
+          rc=0
+          git grep --text -nE "$ADMIN_API_PATTERN" -- ':!.github/workflows/ci.yml' || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::admin API reference found in the source"
+            exit 1
+          elif [ "$rc" -ne 1 ]; then
+            echo "::error::git grep failed with exit code $rc"
+            exit "$rc"
+          fi
+
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --locked --release
+
+      - name: No admin API references in the binary
+        run: |
+          # grep exits 0 on a match, 1 on none, and 2 on error (a missing binary included).
+          rc=0
+          grep -aoE "$ADMIN_API_PATTERN" target/release/cachekit-cli || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::admin API reference found in the release binary"
+            exit 1
+          elif [ "$rc" -ne 1 ]; then
+            echo "::error::grep failed with exit code $rc"
+            exit "$rc"
+          fi
