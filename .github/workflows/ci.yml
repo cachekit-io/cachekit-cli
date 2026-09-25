@@ -10,8 +10,9 @@ permissions:
   contents: read
 
 env:
-  # This CLI calls user-scoped endpoints only. Any reference to the
-  # platform-admin API in the source or the built binary fails the build.
+  # This CLI calls user-scoped endpoints only. These steps are a tripwire,
+  # not the access control: a literal reference to the platform-admin API in
+  # the source or the built binary fails the build.
   ADMIN_API_PATTERN: "/api/admin|platform-admins|flagship"
 
 jobs:
