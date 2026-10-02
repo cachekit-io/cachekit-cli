@@ -124,9 +124,17 @@ log or environment dump from the command does not carry your keys.
 
 ### Signals
 
-ck forwards SIGTERM and SIGHUP to the command. On those and on SIGINT or
-SIGQUIT it waits for the command, stores nothing and exits 128 plus the
-signal number.
+When ck itself receives SIGTERM, SIGHUP, SIGINT or SIGQUIT, the run is
+interrupted. ck forwards SIGTERM and SIGHUP to the command; SIGINT and SIGQUIT
+already reach it from the terminal. ck then waits for the command to exit, but
+not for a background job it left holding the output. An interrupted run
+prints nothing, stores nothing and exits 128 plus the signal number.
+
+A command that dies of a signal ck did not receive, such as one that kills
+itself, has simply failed: ck backs off and serves stored output as for any
+other failure. A signal ck inherits as ignored, as under `nohup`, stays
+ignored: ck neither forwards it nor stops for it, and the command inherits it
+ignored too.
 
 ### Platforms
 

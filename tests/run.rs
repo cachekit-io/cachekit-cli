@@ -499,13 +499,18 @@ fn sigterm_is_forwarded_and_nothing_is_stored() {
 fn sigint_waits_for_the_child_and_stores_nothing() {
     let s = Sandbox::new();
     s.set("sleep", "0.6");
+    let started = Instant::now();
     let child = s.spawn(&["--ttl", "1h"]);
-    sleep(Duration::from_millis(200));
+    wait_until(|| s.runs() == 1);
     // Only ck gets it, as if the child ignored the terminal's interrupt.
     signal(&child, rustix::process::Signal::INT);
     let out = child.wait_with_output().unwrap();
     assert_eq!(code(&out), 128 + 2);
-    assert_eq!(stdout(&out), "hello\n", "ck did not wait for the child");
+    assert!(
+        started.elapsed() >= Duration::from_millis(550),
+        "ck did not wait for the child"
+    );
+    assert_eq!(stdout(&out), "", "an interrupted run printed its output");
 
     s.unset("sleep");
     s.run(&["--ttl", "1h"]);
@@ -562,7 +567,8 @@ fn a_process_group_interrupt_stores_nothing() {
     s.set("sleep", "5");
     for round in 0..40 {
         let child = s.ck(&flags).process_group(0).spawn().unwrap();
-        sleep(Duration::from_millis(100));
+        // The shim records its call before it sleeps.
+        wait_until(|| s.runs() == round + 2);
         let group = rustix::process::Pid::from_raw(child.id() as i32).unwrap();
         rustix::process::kill_process_group(group, rustix::process::Signal::INT).unwrap();
         let out = child.wait_with_output().unwrap();
@@ -692,9 +698,11 @@ fn an_interrupt_the_command_traps_still_stores_nothing() {
     // of it, so only ck's own handler can tell interrupted from failed.
     let s = Sandbox::new();
     let flag = s.home().join("slow");
+    let ready = s.home().join("ready");
     let script = format!(
-        "trap 'exit 1' INT; [ -f '{}' ] && sleep 5; echo hi",
-        flag.display()
+        "trap 'exit 1' INT; [ -f '{0}' ] && touch '{1}' && sleep 5; echo hi",
+        flag.display(),
+        ready.display()
     );
     let args = [
         "run", "--ttl", "1s", "--stale", "1h", "--", "sh", "-c", &script,
@@ -703,8 +711,10 @@ fn an_interrupt_the_command_traps_still_stores_nothing() {
     sleep(PAST_TTL);
     fs::write(&flag, "").unwrap();
     for round in 0..20 {
+        let _ = fs::remove_file(&ready);
         let child = s.ck(&args).process_group(0).spawn().unwrap();
-        sleep(Duration::from_millis(150));
+        // Signal only once the trap is set.
+        wait_until(|| ready.exists());
         let group = rustix::process::Pid::from_raw(child.id() as i32).unwrap();
         rustix::process::kill_process_group(group, rustix::process::Signal::INT).unwrap();
         let out = child.wait_with_output().unwrap();
@@ -717,7 +727,8 @@ fn an_interrupt_the_command_traps_still_stores_nothing() {
 fn a_command_that_signals_itself_is_a_failure() {
     // ck received nothing, so a command dead of its own signal failed: the
     // stale value is served with exit 0 and a marker is set.
-    for sig in ["TERM", "INT", "HUP", "QUIT"] {
+    // One forwarded signal and one that is not: the rule is the same for all.
+    for sig in ["TERM", "INT"] {
         let s = Sandbox::new();
         let flags = ["--ttl", "1s", "--stale", "1h"];
         s.run(&flags);
@@ -737,12 +748,16 @@ fn a_command_that_signals_itself_is_a_failure() {
 #[test]
 fn sigterm_stops_ck_when_only_a_background_job_holds_stdout() {
     let s = Sandbox::new();
+    let ready = s.home().join("ready");
+    // The signal lands while the command is alive; it then dies of it,
+    // leaving a background job holding its stdout.
+    let script = format!("sleep 8 & touch '{}'; sleep 20", ready.display());
     let mut child = s
-        .ck(&["run", "--", "sh", "-c", "sleep 8 & echo hi"])
+        .ck(&["run", "--", "sh", "-c", &script])
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    sleep(Duration::from_millis(400));
+    wait_until(|| ready.exists());
     let started = Instant::now();
     signal(&child, rustix::process::Signal::TERM);
     // Time ck's own exit: the background sleep still holds the pipes.
@@ -757,6 +772,10 @@ fn sigterm_stops_ck_when_only_a_background_job_holds_stdout() {
         sleep(Duration::from_millis(20));
     };
     assert_eq!(status.code(), Some(128 + 15));
+    assert!(
+        entries(&s.data_dir()).is_empty(),
+        "the interrupted run was stored"
+    );
 }
 
 #[test]
@@ -782,4 +801,55 @@ fn a_fifo_file_key_exits_125_without_hanging() {
     }
     let out = child.wait_with_output().unwrap();
     assert_eq!((code(&out), s.runs()), (125, 0), "{}", stderr(&out));
+}
+
+/// Poll `ready` until it holds, failing the test after 5 s.
+fn wait_until(ready: impl Fn() -> bool) {
+    let started = Instant::now();
+    while !ready() {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "timed out waiting for readiness"
+        );
+        sleep(Duration::from_millis(5));
+    }
+}
+
+/// Every thread but main blocks the handled signals, so their handlers run
+/// on the main thread. Linux routes a group signal to the leader anyway, so
+/// only the masks themselves can show a helper thread that does not block.
+#[cfg(target_os = "linux")]
+#[test]
+fn helper_threads_block_the_handled_signals() {
+    let s = Sandbox::new();
+    s.set("sleep", "2");
+    let mut child = s.spawn(&["--ttl", "1h"]);
+    wait_until(|| s.runs() == 1);
+    let pid = child.id();
+    let mask_of = |tid: &str| {
+        let status = fs::read_to_string(format!("/proc/{pid}/task/{tid}/status")).unwrap();
+        let line = status.lines().find(|l| l.starts_with("SigBlk:")).unwrap();
+        u64::from_str_radix(line["SigBlk:".len()..].trim(), 16).unwrap()
+    };
+    // SIGHUP 1, SIGINT 2, SIGQUIT 3, SIGTERM 15.
+    let handled = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 14);
+    let mut helpers = 0;
+    for task in fs::read_dir(format!("/proc/{pid}/task")).unwrap() {
+        let tid = task.unwrap().file_name().into_string().unwrap();
+        let mask = mask_of(&tid);
+        if tid == pid.to_string() {
+            assert_eq!(mask & handled, 0, "the main thread blocks a handled signal");
+        } else {
+            assert_eq!(
+                mask & handled,
+                handled,
+                "thread {tid} does not block every handled signal"
+            );
+            helpers += 1;
+        }
+    }
+    // The signal thread and tokio's blocking-pool thread.
+    assert!(helpers >= 2, "found {helpers} helper threads");
+    child.kill().unwrap();
+    let _ = child.wait();
 }

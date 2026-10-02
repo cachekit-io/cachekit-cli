@@ -7,6 +7,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
 use signal_hook::consts::{SIGCHLD, SIGHUP, SIGINT, SIGQUIT, SIGTERM};
@@ -36,11 +37,10 @@ pub enum Ran {
     StatusUnknown {
         stdout: Stdout,
     },
-    /// ck received one of [`HANDLED`]. Nothing is stored: the caller prints
-    /// any captured output and exits 128 + n.
+    /// ck received one of [`HANDLED`]. The run writes nothing: no stdout,
+    /// no entry and no marker. The caller exits 128 + n.
     Interrupted {
         signal: i32,
-        stdout: Stdout,
     },
 }
 
@@ -49,10 +49,10 @@ pub enum Stdout {
     Captured(Vec<u8>),
     /// Already written to ck's stdout.
     Written,
-    /// Being streamed when ck's reader went away. The pipe was dropped, so
-    /// the command most likely died of SIGPIPE, which says nothing about
-    /// the origin.
-    ReaderGone,
+    /// Being streamed when ck's own stdout failed: the reader went away, or
+    /// the write hit ENOSPC or EIO. The pipe was dropped, so the command most
+    /// likely died of SIGPIPE, which says nothing about the origin.
+    OutputLost,
 }
 
 impl Stdout {
@@ -78,8 +78,8 @@ enum State {
 /// SIGTERM and SIGHUP are forwarded to the child. SIGINT and SIGQUIT are not:
 /// the child shares ck's foreground process group and has already had them
 /// from the terminal, and some programs treat a second interrupt as a hard
-/// abort. On any of them ck waits for the child, stores nothing, and exits
-/// 128 + n.
+/// abort. On any of them ck waits for the child to exit (not for whatever
+/// still holds its stdout), writes nothing, and exits 128 + n.
 ///
 /// A signal ck inherited as ignored (`nohup`, a background job) is left
 /// ignored, so the command inherits it ignored too and ck never forwards it:
@@ -119,23 +119,29 @@ impl Supervisor {
             .name("signals".into())
             .spawn(move || {
                 block_handled_signals();
-                for sig in signals.forever() {
-                    let state = thread_state.lock().unwrap_or_else(PoisonError::into_inner);
-                    match *state {
-                        State::Idle => std::process::exit(128 + sig),
-                        State::Running(pid) => {
-                            forward(pid, sig);
-                            // A command that has exited while a background
-                            // job still holds its stdout is only a zombie:
-                            // nothing is left to wait for.
-                            let exited = WaitIdOptions::EXITED
-                                | WaitIdOptions::NOWAIT
-                                | WaitIdOptions::NOHANG;
-                            if let Ok(Some(_)) = rustix::process::waitid(WaitId::Pid(pid), exited) {
-                                std::process::exit(128 + sig);
+                // The first handled signal decides how ck ends; it never
+                // returns to the loop.
+                if let Some(sig) = signals.forever().next() {
+                    let running = {
+                        let state = thread_state.lock().unwrap_or_else(PoisonError::into_inner);
+                        match *state {
+                            State::Idle => std::process::exit(128 + sig),
+                            State::Running(pid) => {
+                                // Under the lock, so the pid cannot be reaped
+                                // and reused before the signal lands.
+                                forward(pid, sig);
+                                pid
                             }
                         }
-                    }
+                    };
+                    // Wait for the command itself, not for EOF on its stdout:
+                    // a background job it started may hold that open for
+                    // ever. ECHILD means main has already reaped it.
+                    let exited = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT;
+                    while let Err(rustix::io::Errno::INTR) =
+                        rustix::process::waitid(WaitId::Pid(running), exited)
+                    {}
+                    std::process::exit(128 + sig);
                 }
             })
             .map_err(|e| Fatal(format!("cannot start the signal thread: {e}")))?;
@@ -151,6 +157,35 @@ impl Supervisor {
         i32::try_from(self.received.load(Ordering::SeqCst))
             .ok()
             .filter(|&s| s != 0)
+    }
+
+    /// [`Self::received`], judged once the child has exited.
+    ///
+    /// On Linux a process-group signal is queued to every member before any
+    /// of them can exit, so ck's flag is already set. Other kernels (XNU)
+    /// signal the members one by one, newest first, and promise no order
+    /// against the child's exit. So when the child died of a handled signal
+    /// and ck has not seen one, wait briefly: a group signal reaches ck
+    /// within microseconds, and a signal the command sent itself never does.
+    fn received_after(&self, status: Option<&std::process::ExitStatus>) -> Option<i32> {
+        const GRACE: Duration = Duration::from_millis(50);
+        if let Some(signal) = self.received() {
+            return Some(signal);
+        }
+        if !status
+            .and_then(|s| s.signal())
+            .is_some_and(|s| HANDLED.contains(&s))
+        {
+            return None;
+        }
+        let deadline = Instant::now() + GRACE;
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+            if let Some(signal) = self.received() {
+                return Some(signal);
+            }
+        }
+        None
     }
 
     /// Run `argv` with every `CACHEKIT_*` variable removed from its
@@ -219,8 +254,9 @@ impl Supervisor {
         // Only a signal ck itself received is an interruption. A command that
         // dies of a signal on its own (`kill -INT $$`, `pkill op`) failed,
         // and may be answered with stale output.
-        if let Some(signal) = self.received() {
-            return Ran::Interrupted { signal, stdout };
+        if let Some(signal) = self.received_after(status.as_ref().ok()) {
+            drop(stdout);
+            return Ran::Interrupted { signal };
         }
         let status = match status {
             Ok(status) => status,
@@ -259,7 +295,7 @@ fn collect(mut pipe: impl Read) -> Stdout {
             if emit(&buffer) && emit(&chunk[..n]) && stream(pipe, &mut chunk) {
                 return Stdout::Written;
             }
-            return Stdout::ReaderGone;
+            return Stdout::OutputLost;
         }
         buffer.extend_from_slice(&chunk[..n]);
     }
@@ -294,10 +330,11 @@ fn forward(pid: Pid, sig: i32) {
 }
 
 /// Block [`HANDLED`] on the calling thread. ck calls this on every thread it
-/// starts (the signal thread and tokio's blocking pool), so the kernel always
-/// runs their handlers on the main thread. A handler there finishes before
-/// the main thread's `read` or `waitid` returns, so `received` is always set
-/// before the main thread decides whether the run was interrupted.
+/// starts (the signal thread and tokio's blocking pool), so their handlers
+/// always run on the main thread: a signal delivered to ck is recorded before
+/// the main thread's next `read` or `waitid` returns. Whether it is
+/// delivered before the child exits depends on the kernel; see
+/// [`Supervisor::received_after`].
 #[allow(unsafe_code)]
 pub(crate) fn block_handled_signals() {
     // SAFETY: `sigemptyset` and `sigaddset` initialise a local set, and

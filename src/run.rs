@@ -145,10 +145,7 @@ impl Call<'_> {
                     None => code,
                 };
             }
-            Ran::Interrupted { signal, stdout } => {
-                stdout.emit_captured();
-                return 128 + signal;
-            }
+            Ran::Interrupted { signal } => return 128 + signal,
             Ran::StatusUnknown { stdout } => {
                 return match (stale, stdout) {
                     (Some(stale), Stdout::Captured(_)) => self.serve_stale(&stale, None, None),
@@ -180,7 +177,7 @@ impl Call<'_> {
             return 0;
         }
 
-        if matches!(stdout, Stdout::ReaderGone) {
+        if matches!(stdout, Stdout::OutputLost) {
             // ck's reader left mid-stream and the command most likely died of
             // SIGPIPE: no evidence about the origin, so no marker.
             return code;
@@ -255,7 +252,7 @@ fn run_uncached(supervisor: &Supervisor, argv: &[std::ffi::OsString]) -> i32 {
     match supervisor.run(argv, false) {
         Ran::SpawnFailed { code } | Ran::Exited { code, .. } => code,
         Ran::StatusUnknown { .. } => 126,
-        Ran::Interrupted { signal, .. } => 128 + signal,
+        Ran::Interrupted { signal } => 128 + signal,
     }
 }
 
