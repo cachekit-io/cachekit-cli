@@ -111,6 +111,10 @@ impl Supervisor {
             .filter(|&s| !inherited_ignored(s))
             .collect();
         let fail = |e: std::io::Error| Fatal(format!("cannot install signal handlers: {e}"));
+        // The iterator's handlers go in first: a signal that lands before the
+        // flag handlers below then still reaches the signal thread, which
+        // finds `Idle` and exits 128 + n, instead of setting only the flag.
+        let mut signals = Signals::new(&handled).map_err(fail)?;
         let received = Arc::new(AtomicUsize::new(0));
         for &sig in &handled {
             let value = usize::try_from(sig)
@@ -121,7 +125,6 @@ impl Supervisor {
         if sigchld_ignored {
             signal_hook::flag::register(SIGCHLD, Arc::new(AtomicBool::new(false))).map_err(fail)?;
         }
-        let mut signals = Signals::new(&handled).map_err(fail)?;
         let state = Arc::new(Mutex::new(State::Idle));
         let first = Arc::new(AtomicUsize::new(0));
         let (thread_state, thread_first) = (Arc::clone(&state), Arc::clone(&first));
@@ -198,14 +201,20 @@ impl Supervisor {
     /// yet, so wait briefly for it before recording the latest one instead.
     fn interrupted_by(&self, status: Option<&std::process::ExitStatus>) -> Option<i32> {
         let latest = self.received_after(status)?;
+        Some(self.settle_first(latest))
+    }
+
+    /// The first signal, as the signal thread records it. That thread may not
+    /// have run yet, so wait briefly for it before recording `latest`.
+    fn settle_first(&self, latest: i32) -> i32 {
         let deadline = Instant::now() + Duration::from_millis(50);
         while Instant::now() < deadline {
             match i32::try_from(self.first.load(Ordering::SeqCst)) {
-                Ok(first) if first != 0 => return Some(first),
+                Ok(first) if first != 0 => return first,
                 _ => std::thread::sleep(Duration::from_millis(1)),
             }
         }
-        Some(record_first(&self.first, latest).0)
+        record_first(&self.first, latest).0
     }
 
     /// Run `argv` with every `CACHEKIT_*` variable removed from its
@@ -233,12 +242,16 @@ impl Supervisor {
             // child yet" and "child running".
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             // A signal that arrived while this thread held the lock found the
-            // signal thread blocked on it: honour it now, before any command
-            // starts. One that lands inside `spawn` itself is honoured only
-            // when the command exits; see the README.
-            if let Some(signal) = self.received() {
+            // signal thread blocked on it: start no command. Release the lock
+            // so the signal thread, which sees signals in order, decides the
+            // exit code. A SIGINT or SIGQUIT that lands inside `spawn` itself
+            // may not reach the command; ck still exits 128 + n when the
+            // command exits. A TERM or HUP there is forwarded once `spawn`
+            // returns.
+            if let Some(latest) = self.received() {
+                drop(state);
                 return Ran::Interrupted {
-                    signal: record_first(&self.first, signal).0,
+                    signal: self.settle_first(latest),
                 };
             }
             match command.spawn() {

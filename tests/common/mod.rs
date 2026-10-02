@@ -78,10 +78,15 @@ impl Sandbox {
         self.read("calls").lines().count()
     }
 
-    /// `ck <args>` in this sandbox, with stdin on /dev/null and no CacheKit
-    /// variables inherited from the machine running the tests.
+    /// `ck <args>` in this sandbox, in its own process group, with stdin on
+    /// /dev/null and no CacheKit variables inherited from the machine running
+    /// the tests.
     pub fn ck(&self, args: &[&str]) -> Command {
+        use std::os::unix::process::CommandExt;
         let mut cmd = Command::new(BIN);
+        // Its own process group, so a failing test can kill ck together with
+        // its command and any background job (see `wait_exit`).
+        cmd.process_group(0);
         cmd.args(args);
         for (name, _) in std::env::vars_os() {
             if name.to_string_lossy().starts_with("CACHEKIT_") {

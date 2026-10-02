@@ -949,8 +949,10 @@ fn a_signal_after_the_command_exited_stops_ck() {
     );
 }
 
-/// Wait for `child` to exit, failing the test with `msg` after `limit`; the
-/// child is killed first, so a failure leaves no process behind.
+/// Wait for `child` to exit, failing the test with `msg` after `limit`.
+/// Before failing it kills the child's whole process group, so ck, its
+/// command and any background job all go: `Sandbox::ck` makes ck a group
+/// leader.
 fn wait_exit(
     child: &mut std::process::Child,
     limit: Duration,
@@ -962,7 +964,10 @@ fn wait_exit(
             return status;
         }
         if started.elapsed() >= limit {
-            // Never leave a failing test's process running.
+            // Never leave a failing test's processes running.
+            if let Some(group) = rustix::process::Pid::from_raw(child.id() as i32) {
+                let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+            }
             let _ = child.kill();
             let _ = child.wait();
             panic!("{msg}");
@@ -1008,8 +1013,10 @@ fn repeated_signals_start_one_waiter() {
             .unwrap()
             .count()
     };
+    let baseline = threads();
     signal(&child, rustix::process::Signal::TERM);
-    sleep(Duration::from_millis(100));
+    // The first signal starts exactly one waiter.
+    wait_until(|| threads() == baseline + 1);
     let after_one = threads();
     for _ in 0..50 {
         signal(&child, rustix::process::Signal::TERM);

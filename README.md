@@ -135,10 +135,11 @@ An interrupted run discards the output ck was holding back, stores nothing,
 and exits 128 plus the number of the first signal ck received. Signals that
 arrive together count in signal-number order. Output already written, by an
 uncached call or past 20 MiB, stays written, and a cache entry being written
-is never left half-written. On a run streamed past 20 MiB, ck ends as soon as
-the command does, so the last part of the output it was still relaying can be
-cut off. A signal that lands in the millisecond or so while ck is starting the
-command is honoured only when the command exits.
+is never left half-written. On an interrupted run streamed past 20 MiB, ck
+ends as soon as the command does, so the last part of the output it was still
+relaying can be cut off. A SIGINT or SIGQUIT that lands while ck is starting
+the command may not reach it; ck still exits 128 plus the signal number when
+the command exits.
 
 A command that dies of a signal ck did not receive, such as one that kills
 itself, has simply failed: ck backs off and serves stored output as for any
