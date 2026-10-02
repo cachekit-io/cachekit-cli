@@ -5,11 +5,11 @@ use std::io::{ErrorKind, Read};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
-use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
+use signal_hook::consts::{SIGCHLD, SIGHUP, SIGINT, SIGQUIT, SIGTERM};
 use signal_hook::iterator::Signals;
 
 use crate::{emit, warn, Fatal};
@@ -28,6 +28,12 @@ pub enum Ran {
     },
     Exited {
         code: i32,
+        stdout: Stdout,
+    },
+    /// The command ran, but its exit status could not be collected. That is
+    /// no evidence the origin failed, so it is treated like a spawn failure:
+    /// no marker.
+    StatusUnknown {
         stdout: Stdout,
     },
     /// ck received one of [`HANDLED`], or the command died of one. Nothing
@@ -70,6 +76,10 @@ pub struct Supervisor {
     /// Set inside the signal handler itself, so it is visible before the
     /// main thread can reap a child killed by the same process-group signal.
     received: Arc<AtomicUsize>,
+    /// SIGCHLD was inherited as ignored. ck handles it itself, or the kernel
+    /// would reap the child before ck could read its exit status, and gives
+    /// the child the ignored disposition back.
+    sigchld_ignored: bool,
 }
 
 impl Supervisor {
@@ -84,6 +94,10 @@ impl Supervisor {
             let value = usize::try_from(sig)
                 .unwrap_or_else(|_| unreachable!("signal numbers are positive"));
             signal_hook::flag::register_usize(sig, Arc::clone(&received), value).map_err(fail)?;
+        }
+        let sigchld_ignored = inherited_ignored(SIGCHLD);
+        if sigchld_ignored {
+            signal_hook::flag::register(SIGCHLD, Arc::new(AtomicBool::new(false))).map_err(fail)?;
         }
         let mut signals = Signals::new(&handled).map_err(fail)?;
         let state = Arc::new(Mutex::new(State::Idle));
@@ -100,7 +114,11 @@ impl Supervisor {
                 }
             })
             .map_err(|e| Fatal(format!("cannot start the signal thread: {e}")))?;
-        Ok(Self { state, received })
+        Ok(Self {
+            state,
+            received,
+            sigchld_ignored,
+        })
     }
 
     /// The latest handled signal ck received, if any.
@@ -125,6 +143,9 @@ impl Supervisor {
         }
         if capture {
             command.stdout(Stdio::piped());
+        }
+        if self.sigchld_ignored {
+            ignore_sigchld_after_fork(&mut command);
         }
 
         let mut child = {
@@ -160,10 +181,16 @@ impl Supervisor {
         // signal forwarded in between reaches a zombie, never a recycled pid.
         let pid = pid_of(child.id());
         let exited = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT;
-        while let Err(rustix::io::Errno::INTR) = rustix::process::waitid(WaitId::Pid(pid), exited) {
-        }
+        let waited = loop {
+            match rustix::process::waitid(WaitId::Pid(pid), exited) {
+                Err(rustix::io::Errno::INTR) => {}
+                other => break other,
+            }
+        };
         *self.state.lock().unwrap_or_else(PoisonError::into_inner) = State::Idle;
-        let status = child.wait();
+        let status = waited
+            .map_err(std::io::Error::from)
+            .and_then(|_| child.wait());
         let died_of = status
             .as_ref()
             .ok()
@@ -172,15 +199,16 @@ impl Supervisor {
         if let Some(signal) = self.received().or(died_of) {
             return Ran::Interrupted { signal, stdout };
         }
-        let code = match status {
-            Ok(status) => status
-                .code()
-                .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)),
+        let status = match status {
+            Ok(status) => status,
             Err(e) => {
                 warn(&format!("cannot collect the command's exit status: {e}"));
-                126
+                return Ran::StatusUnknown { stdout };
             }
         };
+        let code = status
+            .code()
+            .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
         Ran::Exited { code, stdout }
     }
 }
@@ -240,7 +268,7 @@ fn forward(pid: Pid, sig: i32) {
 /// Whether `sig` is ignored, as inherited from ck's parent.
 ///
 /// No dependency offers a safe query of a signal's disposition, so this is
-/// ck's one `unsafe` block.
+/// one of ck's two `unsafe` blocks.
 #[allow(unsafe_code)]
 fn inherited_ignored(sig: i32) -> bool {
     // SAFETY: an all-zero `sigaction` is a valid value of the C struct, and
@@ -252,6 +280,24 @@ fn inherited_ignored(sig: i32) -> bool {
         (rc, old)
     };
     rc == 0 && old.sa_sigaction == libc::SIG_IGN
+}
+
+/// Set SIGCHLD back to ignored in the child, between fork and exec, so the
+/// command inherits the disposition it would have had without ck.
+#[allow(unsafe_code)]
+fn ignore_sigchld_after_fork(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the closure runs in the forked child before exec and calls
+    // only `signal`, which is async-signal-safe, allocating nothing and
+    // taking no lock.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::signal(libc::SIGCHLD, libc::SIG_IGN) == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
 }
 
 fn pid_of(id: u32) -> Pid {

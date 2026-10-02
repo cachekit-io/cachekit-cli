@@ -630,3 +630,48 @@ fn a_signal_ignored_by_the_caller_stays_ignored() {
     );
     assert_eq!(entries(&s.data_dir()).len(), 1, "the run was not cached");
 }
+
+/// `ck <args>` started with SIGCHLD ignored, as a parent can leave it.
+/// Shells cannot do this (dash's `trap '' CHLD` keeps the default), so the
+/// test sets the disposition itself between fork and exec.
+#[allow(unsafe_code)]
+fn with_sigchld_ignored(mut cmd: Command) -> std::process::Output {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: only the async-signal-safe `signal` runs between fork and exec.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::signal(libc::SIGCHLD, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+    cmd.output().unwrap()
+}
+
+#[test]
+fn an_inherited_ignored_sigchld_does_not_fake_a_failure() {
+    let s = Sandbox::new();
+    for call in 1..=2 {
+        let out = with_sigchld_ignored(s.ck(&["run", "--", "origin"]));
+        assert_eq!(
+            (code(&out), stdout(&out)),
+            (0, "hello\n".into()),
+            "call {call}: {}",
+            stderr(&out)
+        );
+    }
+    assert_eq!(s.runs(), 1, "the first run was not cached");
+
+    // The command itself still inherits SIGCHLD ignored.
+    #[cfg(target_os = "linux")]
+    {
+        let out = with_sigchld_ignored(s.ck(&["run", "--", "grep", "SigIgn", "/proc/self/status"]));
+        let mask = stdout(&out);
+        let bits =
+            u64::from_str_radix(mask.trim().trim_start_matches("SigIgn:").trim(), 16).unwrap();
+        assert_ne!(
+            bits & (1 << (libc::SIGCHLD - 1)),
+            0,
+            "SIGCHLD is not ignored in the command: {mask}"
+        );
+    }
+}

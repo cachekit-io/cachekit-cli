@@ -151,6 +151,17 @@ impl Call<'_> {
                 }
                 return 128 + signal;
             }
+            Ran::StatusUnknown { stdout } => {
+                return match (stale, stdout) {
+                    (Some(stale), Stdout::Captured(_)) => self.serve_stale(&stale, None, None),
+                    (_, stdout) => {
+                        if let Stdout::Captured(out) = &stdout {
+                            emit(out);
+                        }
+                        126
+                    }
+                };
+            }
             Ran::Exited { code, stdout } => (code, stdout),
         };
 
@@ -243,6 +254,7 @@ impl Call<'_> {
 fn run_uncached(supervisor: &Supervisor, argv: &[std::ffi::OsString]) -> i32 {
     match supervisor.run(argv, false) {
         Ran::SpawnFailed { code } | Ran::Exited { code, .. } => code,
+        Ran::StatusUnknown { .. } => 126,
         Ran::Interrupted { signal, .. } => 128 + signal,
     }
 }
