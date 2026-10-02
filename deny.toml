@@ -1,0 +1,12 @@
+# Dependencies come from crates.io and nowhere else. CI adds the two checks
+# cargo-deny cannot make: committed Cargo configs and versioned path deps.
+
+[licenses]
+allow = ["MIT"]
+
+[bans]
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
