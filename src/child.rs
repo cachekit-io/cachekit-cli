@@ -37,8 +37,10 @@ pub enum Ran {
     StatusUnknown {
         stdout: Stdout,
     },
-    /// ck received one of [`HANDLED`]. The run writes nothing: no stdout,
-    /// no entry and no marker. The caller exits 128 + n.
+    /// ck received one of [`HANDLED`] while the command ran. Output ck was
+    /// holding back is discarded and nothing is stored; output already
+    /// written (an uncached call, or past the cap) stays written. The caller
+    /// exits 128 + n, where n is the first signal ck received.
     Interrupted {
         signal: i32,
     },
@@ -79,7 +81,9 @@ enum State {
 /// the child shares ck's foreground process group and has already had them
 /// from the terminal, and some programs treat a second interrupt as a hard
 /// abort. On any of them ck waits for the child to exit (not for whatever
-/// still holds its stdout), writes nothing, and exits 128 + n.
+/// still holds its stdout), discards the output it held back, stores
+/// nothing, and exits 128 + n for the first signal. Later TERM and HUP
+/// signals are forwarded too.
 ///
 /// A signal ck inherited as ignored (`nohup`, a background job) is left
 /// ignored, so the command inherits it ignored too and ck never forwards it:
@@ -88,7 +92,12 @@ pub struct Supervisor {
     state: Arc<Mutex<State>>,
     /// Set inside the signal handler itself, so it is visible before the
     /// main thread can reap a child killed by the same process-group signal.
+    /// It holds the latest signal.
     received: Arc<AtomicUsize>,
+    /// The first signal, recorded once by the signal thread. Every path that
+    /// ends ck on a signal exits 128 + this, so two signals in a row give one
+    /// deterministic exit code.
+    first: Arc<AtomicUsize>,
     /// SIGCHLD was inherited as ignored. ck handles it itself, or the kernel
     /// would reap the child before ck could read its exit status, and gives
     /// the child the ignored disposition back.
@@ -114,40 +123,34 @@ impl Supervisor {
         }
         let mut signals = Signals::new(&handled).map_err(fail)?;
         let state = Arc::new(Mutex::new(State::Idle));
-        let thread_state = Arc::clone(&state);
+        let first = Arc::new(AtomicUsize::new(0));
+        let (thread_state, thread_first) = (Arc::clone(&state), Arc::clone(&first));
         std::thread::Builder::new()
             .name("signals".into())
             .spawn(move || {
                 block_handled_signals();
-                // The first handled signal decides how ck ends; it never
-                // returns to the loop.
-                if let Some(sig) = signals.forever().next() {
-                    let running = {
-                        let state = thread_state.lock().unwrap_or_else(PoisonError::into_inner);
-                        match *state {
-                            State::Idle => std::process::exit(128 + sig),
-                            State::Running(pid) => {
-                                // Under the lock, so the pid cannot be reaped
-                                // and reused before the signal lands.
-                                forward(pid, sig);
-                                pid
+                for sig in signals.forever() {
+                    let state = thread_state.lock().unwrap_or_else(PoisonError::into_inner);
+                    match *state {
+                        State::Idle => std::process::exit(128 + record_first(&thread_first, sig)),
+                        State::Running(pid) => {
+                            // Every TERM and HUP is forwarded, under the lock
+                            // so the pid cannot be reaped and reused first: a
+                            // command that traps the first one still gets the
+                            // supervisor's next.
+                            forward(pid, sig);
+                            if record_first(&thread_first, sig) == sig {
+                                wait_then_exit(pid, Arc::clone(&thread_first));
                             }
                         }
-                    };
-                    // Wait for the command itself, not for EOF on its stdout:
-                    // a background job it started may hold that open for
-                    // ever. ECHILD means main has already reaped it.
-                    let exited = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT;
-                    while let Err(rustix::io::Errno::INTR) =
-                        rustix::process::waitid(WaitId::Pid(running), exited)
-                    {}
-                    std::process::exit(128 + sig);
+                    }
                 }
             })
             .map_err(|e| Fatal(format!("cannot start the signal thread: {e}")))?;
         Ok(Self {
             state,
             received,
+            first,
             sigchld_ignored,
         })
     }
@@ -186,6 +189,21 @@ impl Supervisor {
             }
         }
         None
+    }
+
+    /// The signal that ends this run, once the child has exited: the first
+    /// one ck received. The signal thread records it, and may not have run
+    /// yet, so wait briefly for it before recording the latest one instead.
+    fn interrupted_by(&self, status: Option<&std::process::ExitStatus>) -> Option<i32> {
+        let latest = self.received_after(status)?;
+        let deadline = Instant::now() + Duration::from_millis(50);
+        while Instant::now() < deadline {
+            match i32::try_from(self.first.load(Ordering::SeqCst)) {
+                Ok(first) if first != 0 => return Some(first),
+                _ => std::thread::sleep(Duration::from_millis(1)),
+            }
+        }
+        Some(record_first(&self.first, latest))
     }
 
     /// Run `argv` with every `CACHEKIT_*` variable removed from its
@@ -254,8 +272,7 @@ impl Supervisor {
         // Only a signal ck itself received is an interruption. A command that
         // dies of a signal on its own (`kill -INT $$`, `pkill op`) failed,
         // and may be answered with stale output.
-        if let Some(signal) = self.received_after(status.as_ref().ok()) {
-            drop(stdout);
+        if let Some(signal) = self.interrupted_by(status.as_ref().ok()) {
             return Ran::Interrupted { signal };
         }
         let status = match status {
@@ -273,9 +290,8 @@ impl Supervisor {
 }
 
 /// Read the child's stdout into memory, or, once it passes the cap, write
-/// out what is held and stream the rest. Once ck's own stdout fails (the
-/// reader has gone), the pipe is dropped, so the command gets SIGPIPE just as
-/// it would without ck.
+/// out what is held and stream the rest. Once ck's own stdout fails, the pipe
+/// is dropped, so the command gets SIGPIPE just as it would without ck.
 fn collect(mut pipe: impl Read) -> Stdout {
     let mut buffer = Vec::new();
     let mut chunk = vec![0u8; 64 * 1024];
@@ -317,6 +333,37 @@ fn stream(mut pipe: impl Read, chunk: &mut [u8]) -> bool {
         if !emit(&chunk[..n]) {
             return false;
         }
+    }
+}
+
+/// Record `sig` as the first signal unless one already is; return the first.
+fn record_first(first: &AtomicUsize, sig: i32) -> i32 {
+    let value =
+        usize::try_from(sig).unwrap_or_else(|_| unreachable!("signal numbers are positive"));
+    match first.compare_exchange(0, value, Ordering::SeqCst, Ordering::SeqCst) {
+        Ok(_) => sig,
+        Err(prev) => i32::try_from(prev).unwrap_or(sig),
+    }
+}
+
+/// Wait on another thread for the command itself to exit, not for EOF on its
+/// stdout, which a background job it started may hold open for ever; then
+/// end ck with the first signal. ECHILD means main has already reaped it.
+/// The thread inherits the signal thread's mask, so it takes no signal.
+fn wait_then_exit(pid: Pid, first: Arc<AtomicUsize>) {
+    let spawned = std::thread::Builder::new()
+        .name("waiter".into())
+        .spawn(move || {
+            let exited = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT;
+            while let Err(rustix::io::Errno::INTR) =
+                rustix::process::waitid(WaitId::Pid(pid), exited)
+            {}
+            let code = i32::try_from(first.load(Ordering::SeqCst)).unwrap_or(0);
+            std::process::exit(128 + code);
+        });
+    if let Err(e) = spawned {
+        // Main still ends the run once the command's stdout closes.
+        warn(&format!("cannot start the waiter thread: {e}"));
     }
 }
 

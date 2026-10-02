@@ -474,13 +474,13 @@ fn signal(child: &std::process::Child, sig: rustix::process::Signal) {
 #[test]
 fn sigterm_is_forwarded_and_nothing_is_stored() {
     let s = Sandbox::new();
-    // `sleep` itself, not the shim: a shell killed mid-`sleep` leaves the
-    // sleep holding stdout open, with or without ck.
+    let ready = s.home().join("ready");
+    let script = format!("touch '{}'; exec sleep 5", ready.display());
     let child = s
-        .ck(&["run", "--ttl", "1h", "--", "sleep", "5"])
+        .ck(&["run", "--ttl", "1h", "--", "sh", "-c", &script])
         .spawn()
         .unwrap();
-    sleep(Duration::from_millis(300));
+    wait_until(|| ready.exists());
     let started = Instant::now();
     signal(&child, rustix::process::Signal::TERM);
     let out = child.wait_with_output().unwrap();
@@ -499,15 +499,16 @@ fn sigterm_is_forwarded_and_nothing_is_stored() {
 fn sigint_waits_for_the_child_and_stores_nothing() {
     let s = Sandbox::new();
     s.set("sleep", "0.6");
-    let started = Instant::now();
     let child = s.spawn(&["--ttl", "1h"]);
     wait_until(|| s.runs() == 1);
+    // The shim has 0.6 s of sleep left from here.
+    let started = Instant::now();
     // Only ck gets it, as if the child ignored the terminal's interrupt.
     signal(&child, rustix::process::Signal::INT);
     let out = child.wait_with_output().unwrap();
     assert_eq!(code(&out), 128 + 2);
     assert!(
-        started.elapsed() >= Duration::from_millis(550),
+        started.elapsed() >= Duration::from_millis(500),
         "ck did not wait for the child"
     );
     assert_eq!(stdout(&out), "", "an interrupted run printed its output");
@@ -634,7 +635,8 @@ fn a_signal_ignored_by_the_caller_stays_ignored() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    sleep(Duration::from_millis(250));
+    // The shim records its call after ck has installed its handlers.
+    wait_until(|| s.runs() == 1);
     signal(&child, rustix::process::Signal::HUP);
     let out = child.wait_with_output().unwrap();
     assert_eq!(
@@ -852,4 +854,116 @@ fn helper_threads_block_the_handled_signals() {
     assert!(helpers >= 2, "found {helpers} helper threads");
     child.kill().unwrap();
     let _ = child.wait();
+}
+
+/// Run `script` under ck in its own process group, wait for its ready file,
+/// send `first` to the group (as Ctrl-C does) or to ck alone, then `then` to
+/// ck alone, as a supervisor would. Returns ck's exit code and how long it
+/// took after the second signal.
+fn two_signals(
+    script: &str,
+    first: rustix::process::Signal,
+    to_group: bool,
+    then: rustix::process::Signal,
+) -> (Option<i32>, Duration) {
+    use std::os::unix::process::CommandExt;
+    let s = Sandbox::new();
+    let ready = s.home().join("ready");
+    let script = script.replace("READY", &ready.display().to_string());
+    let mut child = s
+        .ck(&["run", "--", "sh", "-c", &script])
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    wait_until(|| ready.exists());
+    let pid = rustix::process::Pid::from_raw(child.id() as i32).unwrap();
+    if to_group {
+        rustix::process::kill_process_group(pid, first).unwrap();
+    } else {
+        rustix::process::kill_process(pid, first).unwrap();
+    }
+    sleep(Duration::from_millis(200));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the first signal alone ended ck"
+    );
+    let started = Instant::now();
+    rustix::process::kill_process(pid, then).unwrap();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the second signal was not forwarded"
+        );
+        sleep(Duration::from_millis(20));
+    };
+    assert!(
+        entries(&s.data_dir()).is_empty(),
+        "the interrupted run was stored"
+    );
+    (status.code(), started.elapsed())
+}
+
+#[test]
+fn a_term_after_a_trapped_interrupt_is_still_forwarded() {
+    use rustix::process::Signal;
+    // The command ignores the terminal's interrupt; the supervisor's TERM
+    // must still reach it. The exit code names the first signal.
+    let (code, took) = two_signals(
+        "trap '' INT; touch 'READY'; sleep 10 & wait",
+        Signal::INT,
+        true,
+        Signal::TERM,
+    );
+    assert_eq!(code, Some(128 + 2));
+    assert!(took < Duration::from_secs(3), "took {took:?}");
+}
+
+#[test]
+fn a_second_term_reaches_a_command_that_trapped_the_first() {
+    use rustix::process::Signal;
+    let (code, took) = two_signals(
+        "trap 'trap - TERM' TERM; touch 'READY'; sleep 10 & wait; wait",
+        Signal::TERM,
+        false,
+        Signal::TERM,
+    );
+    assert_eq!(code, Some(128 + 15));
+    assert!(took < Duration::from_secs(3), "took {took:?}");
+}
+
+#[test]
+fn a_signal_after_the_command_exited_stops_ck() {
+    let s = Sandbox::new();
+    let ready = s.home().join("ready");
+    // The command exits at once; only its background job holds stdout.
+    let script = format!("sleep 8 & echo hi; touch '{}'", ready.display());
+    let mut child = s
+        .ck(&["run", "--", "sh", "-c", &script])
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_until(|| ready.exists());
+    // Let the shell finish exiting after the touch.
+    sleep(Duration::from_millis(200));
+    let started = Instant::now();
+    signal(&child, rustix::process::Signal::TERM);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "ck waited for the background job"
+        );
+        sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status.code(), Some(128 + 15));
+    assert!(
+        entries(&s.data_dir()).is_empty(),
+        "the interrupted run was stored"
+    );
 }

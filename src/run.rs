@@ -178,8 +178,8 @@ impl Call<'_> {
         }
 
         if matches!(stdout, Stdout::OutputLost) {
-            // ck's reader left mid-stream and the command most likely died of
-            // SIGPIPE: no evidence about the origin, so no marker.
+            // ck's stdout failed mid-stream and the command most likely died
+            // of SIGPIPE: no evidence about the origin, so no marker.
             return code;
         }
         let next = Marker::bumped(marker.as_ref(), code, now);
