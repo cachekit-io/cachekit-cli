@@ -559,7 +559,6 @@ fn version_and_usage() {
 
 #[test]
 fn a_process_group_interrupt_stores_nothing() {
-    use std::os::unix::process::CommandExt;
     // ck and the command both get the signal, as from Ctrl-C at a terminal.
     // ck must never read the dead child as an ordinary failure: that would
     // serve stale with exit 0 and set a marker that suppresses later calls.
@@ -569,7 +568,7 @@ fn a_process_group_interrupt_stores_nothing() {
     sleep(PAST_TTL);
     s.set("sleep", "5");
     for round in 0..40 {
-        let child = s.ck(&flags).process_group(0).spawn().unwrap();
+        let child = s.ck(&flags).spawn().unwrap();
         // The shim records its call before it sleeps.
         wait_until(|| s.runs() == round + 2);
         let group = rustix::process::Pid::from_raw(child.id() as i32).unwrap();
@@ -696,7 +695,6 @@ fn an_inherited_ignored_sigchld_does_not_fake_a_failure() {
 
 #[test]
 fn an_interrupt_the_command_traps_still_stores_nothing() {
-    use std::os::unix::process::CommandExt;
     // terraform-style: the command traps SIGINT and exits 1 instead of dying
     // of it, so only ck's own handler can tell interrupted from failed.
     let s = Sandbox::new();
@@ -715,7 +713,7 @@ fn an_interrupt_the_command_traps_still_stores_nothing() {
     fs::write(&flag, "").unwrap();
     for round in 0..20 {
         let _ = fs::remove_file(&ready);
-        let child = s.ck(&args).process_group(0).spawn().unwrap();
+        let child = s.ck(&args).spawn().unwrap();
         // Signal only once the trap is set.
         wait_until(|| ready.exists());
         let group = rustix::process::Pid::from_raw(child.id() as i32).unwrap();
@@ -858,14 +856,12 @@ fn two_signals(
     to_group: bool,
     then: rustix::process::Signal,
 ) -> (Option<i32>, Duration) {
-    use std::os::unix::process::CommandExt;
     let s = Sandbox::new();
     let ready = s.home().join("ready");
     let script = script.replace("READY", &ready.display().to_string());
     let mut child = s
         .ck(&["run", "--", "sh", "-c", &script])
         .stderr(Stdio::null())
-        .process_group(0)
         .spawn()
         .unwrap();
     wait_until(|| ready.exists());

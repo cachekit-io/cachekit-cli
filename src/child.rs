@@ -111,9 +111,13 @@ impl Supervisor {
             .filter(|&s| !inherited_ignored(s))
             .collect();
         let fail = |e: std::io::Error| Fatal(format!("cannot install signal handlers: {e}"));
-        // The iterator's handlers go in first: a signal that lands before the
-        // flag handlers below then still reaches the signal thread, which
-        // finds `Idle` and exits 128 + n, instead of setting only the flag.
+        // Hold the handled signals on this thread until every handler below
+        // is installed and published and the signal thread runs. A signal
+        // sent meanwhile stays pending, and is delivered once the guard
+        // restores the caller's mask, to both the iterator and the flag.
+        // Without this, one landing between signal-hook's `sigaction` and
+        // its publishing of the action list reached neither.
+        let _held = MaskGuard::block_handled();
         let mut signals = Signals::new(&handled).map_err(fail)?;
         let received = Arc::new(AtomicUsize::new(0));
         for &sig in &handled {
@@ -197,17 +201,17 @@ impl Supervisor {
     }
 
     /// The signal that ends this run, once the child has exited: the first
-    /// one ck received. The signal thread records it, and may not have run
-    /// yet, so wait briefly for it before recording the latest one instead.
+    /// one ck received.
     fn interrupted_by(&self, status: Option<&std::process::ExitStatus>) -> Option<i32> {
         let latest = self.received_after(status)?;
         Some(self.settle_first(latest))
     }
 
-    /// The first signal, as the signal thread records it. That thread may not
-    /// have run yet, so wait briefly for it before recording `latest`.
+    /// The first signal, as the signal thread records it. Every signal that
+    /// set the flag also reached that thread, so wait for its record; record
+    /// `latest` only as a backstop, if the thread has died.
     fn settle_first(&self, latest: i32) -> i32 {
-        let deadline = Instant::now() + Duration::from_millis(50);
+        let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             match i32::try_from(self.first.load(Ordering::SeqCst)) {
                 Ok(first) if first != 0 => return first,
@@ -407,18 +411,45 @@ fn forward(pid: Pid, sig: i32) {
 /// the main thread's next `read` or `waitid` returns. Whether it is
 /// delivered before the child exits depends on the kernel; see
 /// [`Supervisor::received_after`].
-#[allow(unsafe_code)]
 pub(crate) fn block_handled_signals() {
-    // SAFETY: `sigemptyset` and `sigaddset` initialise a local set, and
+    sigmask(libc::SIG_BLOCK, None);
+}
+
+/// Blocks [`HANDLED`] on the calling thread while it lives, then restores
+/// the mask it found with SIG_SETMASK, so a signal the caller already had
+/// blocked stays blocked.
+struct MaskGuard(libc::sigset_t);
+
+impl MaskGuard {
+    fn block_handled() -> Self {
+        Self(sigmask(libc::SIG_BLOCK, None))
+    }
+}
+
+impl Drop for MaskGuard {
+    fn drop(&mut self) {
+        sigmask(libc::SIG_SETMASK, Some(&self.0));
+    }
+}
+
+/// `pthread_sigmask(how, set)` on the calling thread, where `None` means the
+/// [`HANDLED`] set. Returns the previous mask.
+#[allow(unsafe_code)]
+fn sigmask(how: libc::c_int, set: Option<&libc::sigset_t>) -> libc::sigset_t {
+    // SAFETY: `sigemptyset` and `sigaddset` initialise a local set, an
+    // all-zero `sigset_t` is a valid value to receive the old mask, and
     // `pthread_sigmask` changes only the calling thread's mask. Its one
-    // failure, EINVAL, needs an invalid `how`, and SIG_BLOCK is valid.
+    // failure, EINVAL, needs an invalid `how`; callers pass SIG_BLOCK or
+    // SIG_SETMASK.
     unsafe {
-        let mut set: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut set);
+        let mut handled: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut handled);
         for sig in HANDLED {
-            libc::sigaddset(&mut set, sig);
+            libc::sigaddset(&mut handled, sig);
         }
-        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+        let mut old: libc::sigset_t = std::mem::zeroed();
+        libc::pthread_sigmask(how, set.unwrap_or(&handled), &mut old);
+        old
     }
 }
 
