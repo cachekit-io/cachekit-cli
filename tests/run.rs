@@ -764,12 +764,13 @@ fn a_fifo_file_key_exits_125_without_hanging() {
     let s = Sandbox::new();
     fs::create_dir_all(s.config_dir()).unwrap();
     let path = s.config_dir().join("file.key");
-    rustix::fs::mkfifoat(
-        rustix::fs::CWD,
-        &path,
-        rustix::fs::Mode::from_raw_mode(0o600),
-    )
-    .unwrap();
+    // The mkfifo utility: rustix has no mkfifoat on Apple targets.
+    assert!(Command::new("mkfifo")
+        .arg(&path)
+        .status()
+        .unwrap()
+        .success());
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
     let mut child = s.ck(&["run", "--", "origin"]).spawn().unwrap();
     let started = Instant::now();
     while child.try_wait().unwrap().is_none() {
