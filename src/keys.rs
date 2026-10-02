@@ -2,7 +2,7 @@
 
 use std::ffi::OsString;
 use std::fs;
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::Path;
@@ -53,18 +53,32 @@ fn decode_master_key(hex_key: &OsString) -> Result<Vec<u8>, Fatal> {
 /// read a half-written one, and a crash leaves either no key or a whole key.
 pub fn file_key(config_dir: &Path) -> Result<Vec<u8>, Fatal> {
     let path = config_dir.join("file.key");
-    match fs::symlink_metadata(&path) {
-        Err(e) if e.kind() == ErrorKind::NotFound => create_file_key(config_dir, &path)?,
-        Err(e) => return Err(Fatal(format!("cannot read {}: {e}", path.display()))),
-        Ok(_) => {}
-    }
     let unusable = |why: &str| {
         Fatal(format!(
             "{} {why}. Delete it and ck creates a new one; every entry cached under the old key becomes a miss",
             path.display()
         ))
     };
-    let meta = fs::symlink_metadata(&path).map_err(|e| unusable(&e.to_string()))?;
+    // O_NOFOLLOW, then fstat and read the same descriptor: the file whose
+    // owner and mode are checked is the file whose key is used.
+    let open = || {
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+    };
+    let mut file = match open() {
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            create_file_key(config_dir, &path)?;
+            open()
+        }
+        other => other,
+    }
+    .map_err(|e| match e.raw_os_error() {
+        Some(libc::ELOOP) => unusable("is a symbolic link"),
+        _ => unusable(&format!("cannot be read ({e})")),
+    })?;
+    let meta = file.metadata().map_err(|e| unusable(&e.to_string()))?;
     if !meta.is_file() {
         return Err(unusable("is not a regular file"));
     }
@@ -74,11 +88,13 @@ pub fn file_key(config_dir: &Path) -> Result<Vec<u8>, Fatal> {
     if meta.mode() & 0o777 != 0o600 {
         return Err(unusable("must have mode 0600"));
     }
-    let text = fs::read(&path).map_err(|e| unusable(&e.to_string()))?;
-    if text.len() != 64 || !text.iter().all(u8::is_ascii_hexdigit) {
-        return Err(unusable("is not 64 hex characters"));
+    let mut text = Vec::new();
+    file.read_to_end(&mut text)
+        .map_err(|e| unusable(&e.to_string()))?;
+    match hex::decode(&text) {
+        Ok(key) if key.len() == 32 => Ok(key),
+        _ => Err(unusable("is not 64 hex characters")),
     }
-    hex::decode(text).map_err(|_| unusable("is not 64 hex characters"))
 }
 
 fn create_file_key(dir: &Path, path: &Path) -> Result<(), Fatal> {
@@ -166,9 +182,10 @@ pub fn marker_key(value_key: &str) -> String {
     format!("{value_key}:neg")
 }
 
-/// The 64-hex hash part of a value key, used to name its fill lock.
+/// The 64-hex hash part of a key from [`KeyHasher::value_key`], used to name
+/// its fill lock.
 pub fn key_hash(value_key: &str) -> &str {
-    value_key.strip_prefix(KEY_PREFIX).unwrap_or(value_key)
+    &value_key[KEY_PREFIX.len()..]
 }
 
 #[cfg(test)]

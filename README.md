@@ -12,12 +12,17 @@ is not repeated. A typical use is a secret read in a shell startup file, where
 every new shell would otherwise call the secret manager again:
 
 ```sh
-export API_TOKEN="$(ck run --ttl 12h --stale 7d -- op read op://Private/api/token < /dev/null)"
+API_TOKEN="$(ck run --ttl 12h --stale 7d -- op read op://Private/api/token < /dev/null)"
+export API_TOKEN
 ```
 
 The first call runs `op` and stores its output. Calls in the next 12 hours
 print the stored output without running `op`. After that, ck runs `op` again;
-if `op` fails, ck serves the stored output for up to 7 more days.
+if `op` fails, ck serves the stored output for up to 7 more days. That is
+also the revocation bound: a token rotated at the source can still be served
+for up to 12 hours plus 7 days, so set `--stale` to how long you can tolerate
+serving a revoked secret (see [How long a cached secret lives](#how-long-a-cached-secret-lives)).
+Assigning before exporting keeps ck's exit code visible to the shell.
 
 ```text
 ck run [--backend file] [--ttl D] [--stale D] [--scope S] [--refresh] -- <command> [args...]
@@ -108,7 +113,8 @@ To stop serving old output:
 
 Entries are encrypted with AES-256-GCM, and their file names are keyed hashes,
 so neither the output nor the command line appears on disk. The key comes from
-`CACHEKIT_MASTER_KEY` (64 or more hex characters) if it is set. Otherwise ck
+`CACHEKIT_MASTER_KEY` (hex, an even number of characters and at least 64) if
+it is set. Otherwise ck
 creates a random key in `~/.config/ck/file.key` on first use, mode 0600. If
 that file is damaged, ck exits 125 and tells you to delete it; it never
 overwrites it.

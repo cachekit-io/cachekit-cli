@@ -3,8 +3,6 @@
 //! This library exists to serve the `ck` binary and its tests. It is not a
 //! stable API.
 
-#![forbid(unsafe_code)]
-
 use std::ffi::OsString;
 use std::io::{ErrorKind, Write};
 
@@ -27,17 +25,17 @@ pub fn main(args: impl IntoIterator<Item = OsString>) -> i32 {
         Ok(i) => i,
         Err(e) => {
             warn(&e);
-            eprintln!("{}", cli::USAGE);
+            let _ = writeln!(std::io::stderr(), "{}", cli::USAGE);
             return EXIT_CK_ERROR;
         }
     };
     match invocation {
         cli::Invocation::Help => {
-            println!("{}", cli::USAGE);
+            emit(format!("{}\n", cli::USAGE).as_bytes());
             0
         }
         cli::Invocation::Version => {
-            println!("ck {}", env!("CARGO_PKG_VERSION"));
+            emit(format!("ck {}\n", env!("CARGO_PKG_VERSION")).as_bytes());
             0
         }
         cli::Invocation::Run(args) => run::run(&args).unwrap_or_else(|Fatal(e)| {
@@ -48,17 +46,23 @@ pub fn main(args: impl IntoIterator<Item = OsString>) -> i32 {
 }
 
 /// One line on stderr, prefixed so it is never mistaken for the command's.
+/// A closed stderr is not worth dying over, so a failed write is dropped.
 pub(crate) fn warn(message: &str) {
-    eprintln!("ck: {message}");
+    let _ = writeln!(std::io::stderr(), "ck: {message}");
 }
 
-/// Write to stdout. A reader that has gone away (EPIPE) is normal in a
-/// pipeline and stays silent; any other failure is reported.
-pub(crate) fn emit(bytes: &[u8]) {
+/// Write to stdout, and say whether it worked. A reader that has gone away
+/// (EPIPE) is normal in a pipeline and stays silent; any other failure is
+/// reported.
+pub(crate) fn emit(bytes: &[u8]) -> bool {
     let mut out = std::io::stdout().lock();
-    if let Err(e) = out.write_all(bytes).and_then(|()| out.flush()) {
-        if e.kind() != ErrorKind::BrokenPipe {
-            warn(&format!("cannot write stdout: {e}"));
+    match out.write_all(bytes).and_then(|()| out.flush()) {
+        Ok(()) => true,
+        Err(e) => {
+            if e.kind() != ErrorKind::BrokenPipe {
+                warn(&format!("cannot write stdout: {e}"));
+            }
+            false
         }
     }
 }

@@ -6,6 +6,7 @@
 
 use std::fs;
 use std::io::IsTerminal;
+use std::ops::ControlFlow;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -25,7 +26,7 @@ pub fn run(args: &RunArgs) -> Result<i32, Fatal> {
         warn(&format!(
             "stdin is {kind}, so this call is not cached. End the command with `< /dev/null` to cache it"
         ));
-        return uncached(&args.command);
+        return Ok(run_uncached(&Supervisor::install()?, &args.command));
     }
 
     let home = std::env::var_os("HOME")
@@ -68,15 +69,10 @@ impl Call<'_> {
     fn cached(&self) -> Result<i32, Fatal> {
         let value = match self.store.value(&self.key) {
             Ok(v) => v,
-            Err(e) => return self.read_failed(e),
+            Err(e) => return self.read_failed(e, &Supervisor::install()?),
         };
-        let stale = match value.map(|v| self.judge(v)) {
-            Some(Judged::Fresh(stdout)) => {
-                emit(&stdout);
-                return Ok(0);
-            }
-            Some(Judged::Stale(s)) => Some(s),
-            Some(Judged::Expired) | None => None,
+        let ControlFlow::Continue(stale) = self.fresh_or_stale(value) else {
+            return Ok(0);
         };
 
         let supervisor = Supervisor::install()?;
@@ -106,15 +102,10 @@ impl Call<'_> {
             self.store.marker(&self.marker_key),
         ) {
             (Ok(v), Ok(m)) => (v, m),
-            (Err(e), _) | (_, Err(e)) => return self.read_failed_with(e, &supervisor),
+            (Err(e), _) | (_, Err(e)) => return self.read_failed(e, &supervisor),
         };
-        let stale = match value.map(|v| self.judge(v)) {
-            Some(Judged::Fresh(stdout)) => {
-                emit(&stdout);
-                return Ok(0);
-            }
-            Some(Judged::Stale(s)) => Some(s),
-            Some(Judged::Expired) | None => None,
+        let ControlFlow::Continue(stale) = self.fresh_or_stale(value) else {
+            return Ok(0);
         };
         let now = now_ms();
         if let Some(m) = marker.filter(|m| m.is_active(now)) {
@@ -129,25 +120,22 @@ impl Call<'_> {
             return Ok(m.exit);
         }
 
-        let code = self.record(&supervisor, stale, marker, false);
+        let code = self.record(&supervisor, stale, marker);
         drop(lock);
         Ok(code)
     }
 
-    /// `--refresh`: run now, ignoring the value, the marker and the lock.
-    /// Never serves stale.
+    /// `--refresh`: run now, whatever the value, the marker and the lock say.
+    /// Never serves stale. The marker is read only to continue its count.
     fn refresh(&self) -> Result<i32, Fatal> {
         let supervisor = Supervisor::install()?;
-        Ok(self.record(&supervisor, None, None, true))
+        let marker = self.store.marker(&self.marker_key).ok().flatten();
+        Ok(self.record(&supervisor, None, marker))
     }
 
-    fn record(
-        &self,
-        supervisor: &Supervisor,
-        stale: Option<Stale>,
-        marker: Option<Marker>,
-        refresh: bool,
-    ) -> i32 {
+    /// Run the command and record the outcome: the value on success, the
+    /// bumped marker on failure. `marker` is the current one, if any.
+    fn record(&self, supervisor: &Supervisor, stale: Option<Stale>, marker: Option<Marker>) -> i32 {
         let (code, stdout) = match supervisor.run(&self.args.command, true) {
             Ran::SpawnFailed { code } => {
                 // The command never started, so the origin was not reached:
@@ -157,41 +145,35 @@ impl Call<'_> {
                     None => code,
                 };
             }
+            Ran::Interrupted { signal, stdout } => {
+                if let Stdout::Captured(out) = &stdout {
+                    emit(out);
+                }
+                return 128 + signal;
+            }
             Ran::Exited { code, stdout } => (code, stdout),
         };
-        if let Some(sig) = supervisor.received() {
-            if let Stdout::Captured(out) = &stdout {
-                emit(out);
-            }
-            return 128 + sig;
-        }
 
         let now = now_ms();
         if code == 0 {
-            let Stdout::Captured(out) = stdout else {
-                return 0;
-            };
-            // Print before the write-back, so a pipeline sees output at once.
-            emit(&out);
-            let ttl = Duration::from_secs(self.args.ttl_secs + self.args.stale_secs);
-            let stored = self
-                .store
-                .set(&self.key, &Envelope::encode(now, &out), ttl)
-                .and_then(|()| self.store.delete(&self.marker_key));
-            if let Err(e) = stored {
-                warn(&format!(
-                    "the command succeeded but its output was not cached: {e}"
-                ));
+            if let Stdout::Captured(out) = &stdout {
+                // Print before the write-back, so a pipeline sees output at once.
+                emit(out);
+                let ttl = Duration::from_secs(self.args.ttl_secs + self.args.stale_secs);
+                if let Err(e) = self.store.set(&self.key, &Envelope::encode(now, out), ttl) {
+                    warn(&format!(
+                        "the command succeeded but its output was not cached: {e}"
+                    ));
+                }
+            }
+            // A success ends the backoff, whether or not its output was stored.
+            if let Err(e) = self.store.delete(&self.marker_key) {
+                warn(&format!("cannot clear the recorded failure: {e}"));
             }
             return 0;
         }
 
-        let previous = match marker {
-            Some(m) => Some(m),
-            None if refresh => self.store.marker(&self.marker_key).ok().flatten(),
-            None => None,
-        };
-        let next = Marker::bumped(previous.as_ref(), code, now);
+        let next = Marker::bumped(marker.as_ref(), code, now);
         if let Err(e) = self
             .store
             .set(&self.marker_key, &next.encode(), next.backend_ttl(now))
@@ -208,11 +190,19 @@ impl Call<'_> {
         }
     }
 
-    fn judge(&self, envelope: Envelope) -> Judged {
+    /// Print a fresh value and break, or continue with the stale run (if
+    /// `--stale` still allows one) for the caller to fall back on.
+    fn fresh_or_stale(&self, value: Option<Envelope>) -> ControlFlow<(), Option<Stale>> {
+        let Some(envelope) = value else {
+            return ControlFlow::Continue(None);
+        };
         match envelope.freshness(now_ms(), self.args.ttl_secs, self.args.stale_secs) {
-            Freshness::Fresh => Judged::Fresh(envelope.stdout),
-            Freshness::Stale { age_ms } => Judged::Stale(Stale { envelope, age_ms }),
-            Freshness::Expired => Judged::Expired,
+            Freshness::Fresh => {
+                emit(&envelope.stdout);
+                ControlFlow::Break(())
+            }
+            Freshness::Stale { age_ms } => ControlFlow::Continue(Some(Stale { envelope, age_ms })),
+            Freshness::Expired => ControlFlow::Continue(None),
         }
     }
 
@@ -237,14 +227,9 @@ impl Call<'_> {
         0
     }
 
-    fn read_failed(&self, e: ReadError) -> Result<i32, Fatal> {
-        let supervisor = Supervisor::install()?;
-        self.read_failed_with(e, &supervisor)
-    }
-
     /// Any backend error before the run disables caching for this call, never
     /// the command. No further backend calls are made.
-    fn read_failed_with(&self, e: ReadError, supervisor: &Supervisor) -> Result<i32, Fatal> {
+    fn read_failed(&self, e: ReadError, supervisor: &Supervisor) -> Result<i32, Fatal> {
         match e {
             ReadError::Local(fatal) => Err(fatal),
             ReadError::Backend(e) => {
@@ -255,20 +240,10 @@ impl Call<'_> {
     }
 }
 
-enum Judged {
-    Fresh(Vec<u8>),
-    Stale(Stale),
-    Expired,
-}
-
-fn uncached(argv: &[std::ffi::OsString]) -> Result<i32, Fatal> {
-    Ok(run_uncached(&Supervisor::install()?, argv))
-}
-
 fn run_uncached(supervisor: &Supervisor, argv: &[std::ffi::OsString]) -> i32 {
     match supervisor.run(argv, false) {
-        Ran::SpawnFailed { code } => code,
-        Ran::Exited { code, .. } => supervisor.received().map_or(code, |sig| 128 + sig),
+        Ran::SpawnFailed { code } | Ran::Exited { code, .. } => code,
+        Ran::Interrupted { signal, .. } => 128 + signal,
     }
 }
 
@@ -290,7 +265,11 @@ fn uncacheable_stdin() -> Option<&'static str> {
     };
     let kind = meta.file_type();
     if kind.is_char_device() {
-        let null = fs::metadata("/dev/null").ok()?;
+        let Ok(null) = fs::metadata("/dev/null") else {
+            // Without /dev/null to compare against, nothing proves stdin
+            // is empty.
+            return Some("not inspectable");
+        };
         if meta.rdev() == null.rdev() {
             return None;
         }

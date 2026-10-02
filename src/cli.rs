@@ -133,8 +133,8 @@ fn parse_run(mut args: impl Iterator<Item = OsString>) -> Result<Invocation, Str
 fn duration(raw: &OsString, flag: &str) -> Result<u64, String> {
     let bad = || format!("{flag}: {raw:?} is not a duration such as 90s, 15m, 12h or 7d");
     let text = raw.to_str().ok_or_else(bad)?;
-    let split = text.len().checked_sub(1).ok_or_else(bad)?;
-    let (digits, unit) = text.split_at(split);
+    let unit_len = text.chars().last().map_or(0, char::len_utf8);
+    let (digits, unit) = text.split_at(text.len() - unit_len);
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return Err(bad());
     }
@@ -196,6 +196,8 @@ mod tests {
             " 1s",
             "1w",
             "99999999999999999999d",
+            "5é",
+            "é",
         ] {
             assert!(duration(&bad.into(), "--stale").is_err(), "{bad}");
         }

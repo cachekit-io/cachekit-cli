@@ -5,7 +5,7 @@ mod common;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -386,16 +386,65 @@ fn bad_flags_exit_125_before_anything_runs() {
 #[test]
 fn refresh_runs_and_never_serves_stale() {
     let s = Sandbox::new();
-    s.run(&["--ttl", "1h", "--stale", "1h"]);
+    let flags = ["--ttl", "1s", "--stale", "1h"];
+    s.run(&flags);
+    sleep(PAST_TTL);
+    // The stored run is now servable as stale; --refresh must not serve it.
     s.set("out", "new\n");
-    assert_eq!(stdout(&s.run(&["--ttl", "1h", "--refresh"])), "new\n");
-    assert_eq!(stdout(&s.run(&["--ttl", "1h"])), "new\n");
+    assert_eq!(
+        stdout(&s.run(&["--ttl", "1s", "--stale", "1h", "--refresh"])),
+        "new\n"
+    );
 
+    sleep(PAST_TTL);
     s.set("exit", "4");
     s.set("out", "failure output\n");
-    let out = s.run(&["--ttl", "1h", "--stale", "1h", "--refresh"]);
+    let out = s.run(&["--ttl", "1s", "--stale", "1h", "--refresh"]);
     assert_eq!((code(&out), stdout(&out)), (4, "failure output\n".into()));
     assert_eq!(s.runs(), 3);
+}
+
+#[test]
+fn a_success_clears_the_marker_even_when_not_stored() {
+    let s = Sandbox::new();
+    s.set("exit", "1");
+    assert_eq!(code(&s.run(&[])), 1);
+    // A success too large to store must still end the backoff.
+    s.set("exit", "0");
+    s.set("out", &"x".repeat(21 * 1024 * 1024));
+    assert_eq!(code(&s.run(&["--refresh"])), 0);
+    s.set("out", "small\n");
+    let out = s.run(&[]);
+    assert_eq!(
+        (code(&out), stdout(&out)),
+        (0, "small\n".into()),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(s.runs(), 3);
+}
+
+#[test]
+fn a_corrupt_entry_is_a_miss_and_never_served() {
+    let s = Sandbox::new();
+    s.run(&["--ttl", "1h", "--stale", "1h"]);
+    for name in entries(&s.data_dir()) {
+        let path = s.data_dir().join(name);
+        let mut bytes = fs::read(&path).unwrap();
+        // Past the 14-byte file header: flip a ciphertext byte.
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        fs::write(&path, bytes).unwrap();
+    }
+    s.set("out", "rerun\n");
+    let out = s.run(&["--ttl", "1h", "--stale", "1h"]);
+    assert_eq!(
+        (code(&out), stdout(&out)),
+        (0, "rerun\n".into()),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(s.runs(), 2);
 }
 
 #[test]
@@ -491,4 +540,93 @@ fn version_and_usage() {
     assert_eq!(code(&out), 0);
     assert!(stdout(&out).starts_with("ck "));
     assert_eq!(code(&s.ck(&[]).output().unwrap()), 125);
+}
+
+#[test]
+fn a_process_group_interrupt_stores_nothing() {
+    use std::os::unix::process::CommandExt;
+    // ck and the command both get the signal, as from Ctrl-C at a terminal.
+    // ck must never read the dead child as an ordinary failure: that would
+    // serve stale with exit 0 and set a marker that suppresses later calls.
+    let s = Sandbox::new();
+    let flags = ["run", "--ttl", "1s", "--stale", "1h", "--", "origin"];
+    assert_eq!(code(&s.ck(&flags).output().unwrap()), 0);
+    sleep(PAST_TTL);
+    s.set("sleep", "5");
+    for round in 0..40 {
+        let child = s.ck(&flags).process_group(0).spawn().unwrap();
+        sleep(Duration::from_millis(100));
+        let group = rustix::process::Pid::from_raw(child.id() as i32).unwrap();
+        rustix::process::kill_process_group(group, rustix::process::Signal::INT).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(code(&out), 128 + 2, "round {round}: {}", stderr(&out));
+    }
+    assert_eq!(entries(&s.data_dir()).len(), 1, "a marker was stored");
+}
+
+#[test]
+fn a_signal_while_writing_output_stops_ck() {
+    let s = Sandbox::new();
+    // More than a pipe buffer, into a stdout nobody reads: ck blocks writing.
+    let child = s
+        .ck(&["run", "--", "head", "-c", "1000000", "/dev/zero"])
+        .spawn()
+        .unwrap();
+    sleep(Duration::from_millis(500));
+    signal(&child, rustix::process::Signal::TERM);
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(code(&out), 128 + 15);
+    assert!(entries(&s.data_dir()).is_empty(), "the run was cached");
+}
+
+#[test]
+fn a_closed_reader_ends_a_streamed_command() {
+    use std::io::Read;
+    let s = Sandbox::new();
+    let mut child = s.ck(&["run", "--", "yes"]).spawn().unwrap();
+    let mut head = [0u8; 10];
+    child.stdout.take().unwrap().read_exact(&mut head).unwrap();
+    // The read end is dropped here, as `| head -c 10` would.
+    let started = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "ck kept draining a closed pipe"
+        );
+        sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_signal_ignored_by_the_caller_stays_ignored() {
+    let s = Sandbox::new();
+    s.set("sleep", "0.6");
+    // Borrow the sandbox's environment (HOME, PATH, no CACHEKIT_*).
+    let sandbox = s.ck(&[]);
+    // nohup ignores SIGHUP, then execs ck in the same process.
+    let ck = std::path::Path::new(common::BIN);
+    let mut nohup = Command::new("nohup");
+    nohup.arg(ck).args(["run", "--", "origin"]);
+    for (k, v) in sandbox.get_envs() {
+        match v {
+            Some(v) => nohup.env(k, v),
+            None => nohup.env_remove(k),
+        };
+    }
+    let child = nohup
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    sleep(Duration::from_millis(250));
+    signal(&child, rustix::process::Signal::HUP);
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(
+        (code(&out), stdout(&out)),
+        (0, "hello\n".into()),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(entries(&s.data_dir()).len(), 1, "the run was not cached");
 }

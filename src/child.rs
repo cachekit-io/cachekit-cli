@@ -5,7 +5,7 @@ use std::io::{ErrorKind, Read};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
@@ -13,6 +13,9 @@ use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
 use signal_hook::iterator::Signals;
 
 use crate::{emit, warn, Fatal};
+
+/// The signals ck takes over while it may block or run the command.
+const HANDLED: [i32; 4] = [SIGTERM, SIGHUP, SIGINT, SIGQUIT];
 
 /// Output past this is streamed, not cached. The SaaS rejects values over
 /// 25 MB; the margin covers the envelope and encryption overhead.
@@ -27,6 +30,12 @@ pub enum Ran {
         code: i32,
         stdout: Stdout,
     },
+    /// ck received one of [`HANDLED`], or the command died of one. Nothing
+    /// is stored: the caller prints any captured output and exits 128 + n.
+    Interrupted {
+        signal: i32,
+        stdout: Stdout,
+    },
 }
 
 pub enum Stdout {
@@ -37,11 +46,11 @@ pub enum Stdout {
 }
 
 enum State {
-    /// No child yet. A signal now ends ck at once: nothing has been written.
-    Waiting,
+    /// No child is running: none yet, or it has exited. A signal now ends ck
+    /// at once. Nothing is half-written, because entries are written to a
+    /// temp file and renamed into place.
+    Idle,
     Running(Pid),
-    /// The child has exited. Its pid must not be signalled again.
-    Exited,
 }
 
 /// Owns ck's handling of SIGTERM, SIGHUP, SIGINT and SIGQUIT from the point
@@ -52,33 +61,41 @@ enum State {
 /// from the terminal, and some programs treat a second interrupt as a hard
 /// abort. On any of them ck waits for the child, stores nothing, and exits
 /// 128 + n.
+///
+/// A signal ck inherited as ignored (`nohup`, a background job) is left
+/// ignored, so the command inherits it ignored too and ck never forwards it:
+/// wrapping a command must not change what it would do bare.
 pub struct Supervisor {
     state: Arc<Mutex<State>>,
-    received: Arc<AtomicI32>,
+    /// Set inside the signal handler itself, so it is visible before the
+    /// main thread can reap a child killed by the same process-group signal.
+    received: Arc<AtomicUsize>,
 }
 
 impl Supervisor {
     pub fn install() -> Result<Self, Fatal> {
-        let mut signals = Signals::new([SIGTERM, SIGHUP, SIGINT, SIGQUIT])
-            .map_err(|e| Fatal(format!("cannot install signal handlers: {e}")))?;
-        let state = Arc::new(Mutex::new(State::Waiting));
-        let received = Arc::new(AtomicI32::new(0));
-        let (thread_state, thread_received) = (Arc::clone(&state), Arc::clone(&received));
+        let handled: Vec<i32> = HANDLED
+            .into_iter()
+            .filter(|&s| !inherited_ignored(s))
+            .collect();
+        let fail = |e: std::io::Error| Fatal(format!("cannot install signal handlers: {e}"));
+        let received = Arc::new(AtomicUsize::new(0));
+        for &sig in &handled {
+            let value = usize::try_from(sig)
+                .unwrap_or_else(|_| unreachable!("signal numbers are positive"));
+            signal_hook::flag::register_usize(sig, Arc::clone(&received), value).map_err(fail)?;
+        }
+        let mut signals = Signals::new(&handled).map_err(fail)?;
+        let state = Arc::new(Mutex::new(State::Idle));
+        let thread_state = Arc::clone(&state);
         std::thread::Builder::new()
             .name("signals".into())
             .spawn(move || {
                 for sig in signals.forever() {
-                    let _ = thread_received.compare_exchange(
-                        0,
-                        sig,
-                        Ordering::SeqCst,
-                        Ordering::SeqCst,
-                    );
                     let state = thread_state.lock().unwrap_or_else(PoisonError::into_inner);
                     match *state {
-                        State::Waiting => std::process::exit(128 + sig),
+                        State::Idle => std::process::exit(128 + sig),
                         State::Running(pid) => forward(pid, sig),
-                        State::Exited => {}
                     }
                 }
             })
@@ -86,9 +103,11 @@ impl Supervisor {
         Ok(Self { state, received })
     }
 
-    /// The first terminating signal ck received, if any.
-    pub fn received(&self) -> Option<i32> {
-        Some(self.received.load(Ordering::SeqCst)).filter(|&s| s != 0)
+    /// The latest handled signal ck received, if any.
+    fn received(&self) -> Option<i32> {
+        i32::try_from(self.received.load(Ordering::SeqCst))
+            .ok()
+            .filter(|&s| s != 0)
     }
 
     /// Run `argv` with every `CACHEKIT_*` variable removed from its
@@ -143,8 +162,17 @@ impl Supervisor {
         let exited = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT;
         while let Err(rustix::io::Errno::INTR) = rustix::process::waitid(WaitId::Pid(pid), exited) {
         }
-        *self.state.lock().unwrap_or_else(PoisonError::into_inner) = State::Exited;
-        let code = match child.wait() {
+        *self.state.lock().unwrap_or_else(PoisonError::into_inner) = State::Idle;
+        let status = child.wait();
+        let died_of = status
+            .as_ref()
+            .ok()
+            .and_then(|s| s.signal())
+            .filter(|s| HANDLED.contains(s));
+        if let Some(signal) = self.received().or(died_of) {
+            return Ran::Interrupted { signal, stdout };
+        }
+        let code = match status {
             Ok(status) => status
                 .code()
                 .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)),
@@ -158,7 +186,9 @@ impl Supervisor {
 }
 
 /// Read the child's stdout into memory, or, once it passes the cap, write
-/// out what is held and stream the rest.
+/// out what is held and stream the rest. Once ck's own stdout fails (the
+/// reader has gone), the pipe is dropped, so the command gets SIGPIPE just as
+/// it would without ck.
 fn collect(mut pipe: impl Read) -> Stdout {
     let mut buffer = Vec::new();
     let mut chunk = vec![0u8; 64 * 1024];
@@ -175,9 +205,9 @@ fn collect(mut pipe: impl Read) -> Stdout {
         };
         if buffer.len() + n > OUTPUT_CAP {
             warn("the command's output passed 20 MiB, so this run is not cached");
-            emit(&buffer);
-            emit(&chunk[..n]);
-            stream(pipe, &mut chunk);
+            if emit(&buffer) && emit(&chunk[..n]) {
+                stream(pipe, &mut chunk);
+            }
             return Stdout::Written;
         }
         buffer.extend_from_slice(&chunk[..n]);
@@ -186,11 +216,14 @@ fn collect(mut pipe: impl Read) -> Stdout {
 
 fn stream(mut pipe: impl Read, chunk: &mut [u8]) {
     loop {
-        match pipe.read(chunk) {
+        let n = match pipe.read(chunk) {
             Ok(0) => return,
-            Ok(n) => emit(&chunk[..n]),
-            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Ok(n) => n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(e) => return warn(&format!("cannot read the command's output: {e}")),
+        };
+        if !emit(&chunk[..n]) {
+            return;
         }
     }
 }
@@ -202,6 +235,23 @@ fn forward(pid: Pid, sig: i32) {
         _ => return,
     };
     let _ = rustix::process::kill_process(pid, signal);
+}
+
+/// Whether `sig` is ignored, as inherited from ck's parent.
+///
+/// No dependency offers a safe query of a signal's disposition, so this is
+/// ck's one `unsafe` block.
+#[allow(unsafe_code)]
+fn inherited_ignored(sig: i32) -> bool {
+    // SAFETY: an all-zero `sigaction` is a valid value of the C struct, and
+    // with a null new action `sigaction` only writes the current disposition
+    // into `old`; it changes nothing.
+    let (rc, old) = unsafe {
+        let mut old: libc::sigaction = std::mem::zeroed();
+        let rc = libc::sigaction(sig, std::ptr::null(), &mut old);
+        (rc, old)
+    };
+    rc == 0 && old.sa_sigaction == libc::SIG_IGN
 }
 
 fn pid_of(id: u32) -> Pid {

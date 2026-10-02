@@ -27,10 +27,13 @@ fn readme_examples_run() {
     let ck_dir = Path::new(BIN).parent().unwrap();
 
     for example in examples {
-        assert!(
-            example.contains("< /dev/null"),
-            "an example without the redirect:\n{example}"
-        );
+        for call in example.split("ck run").skip(1) {
+            let call = call.split([')', '\n']).next().unwrap_or_default();
+            assert!(
+                call.trim_end().ends_with("< /dev/null"),
+                "a ck run call without the redirect:\n{example}"
+            );
+        }
         let path = std::env::join_paths(
             [s.bin().as_path(), ck_dir]
                 .into_iter()
