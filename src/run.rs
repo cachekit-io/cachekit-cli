@@ -146,18 +146,14 @@ impl Call<'_> {
                 };
             }
             Ran::Interrupted { signal, stdout } => {
-                if let Stdout::Captured(out) = &stdout {
-                    emit(out);
-                }
+                stdout.emit_captured();
                 return 128 + signal;
             }
             Ran::StatusUnknown { stdout } => {
                 return match (stale, stdout) {
                     (Some(stale), Stdout::Captured(_)) => self.serve_stale(&stale, None, None),
                     (_, stdout) => {
-                        if let Stdout::Captured(out) = &stdout {
-                            emit(out);
-                        }
+                        stdout.emit_captured();
                         126
                     }
                 };
@@ -184,6 +180,11 @@ impl Call<'_> {
             return 0;
         }
 
+        if matches!(stdout, Stdout::ReaderGone) {
+            // ck's reader left mid-stream and the command most likely died of
+            // SIGPIPE: no evidence about the origin, so no marker.
+            return code;
+        }
         let next = Marker::bumped(marker.as_ref(), code, now);
         if let Err(e) = self
             .store
@@ -193,11 +194,10 @@ impl Call<'_> {
         }
         match (stdout, stale) {
             (Stdout::Captured(_), Some(stale)) => self.serve_stale(&stale, Some(&next), Some(code)),
-            (Stdout::Captured(out), None) => {
-                emit(&out);
+            (stdout, _) => {
+                stdout.emit_captured();
                 code
             }
-            (Stdout::Written, _) => code,
         }
     }
 

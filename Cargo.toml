@@ -15,9 +15,9 @@ name = "ck"
 path = "src/main.rs"
 
 [lints.rust]
-# deny, not forbid: two audited blocks in src/child.rs read a signal's
-# inherited disposition and restore an ignored SIGCHLD in the child, which
-# no dependency does safely.
+# deny, not forbid: three audited blocks in src/child.rs read a signal's
+# inherited disposition, restore an ignored SIGCHLD in the child, and block
+# ck's handled signals on its helper threads. No dependency does these safely.
 unsafe_code = "deny"
 
 [dependencies]

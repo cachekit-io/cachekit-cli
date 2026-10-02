@@ -444,6 +444,13 @@ fn a_corrupt_entry_is_a_miss_and_never_served() {
         "{}",
         stderr(&out)
     );
+    assert!(
+        !stderr(&out).contains("cache is unavailable"),
+        "{}",
+        stderr(&out)
+    );
+    // A miss refills the entry; a backend error would have run uncached.
+    assert_eq!(stdout(&s.run(&["--ttl", "1h", "--stale", "1h"])), "rerun\n");
     assert_eq!(s.runs(), 2);
 }
 
@@ -595,6 +602,8 @@ fn a_closed_reader_ends_a_streamed_command() {
         );
         sleep(Duration::from_millis(50));
     }
+    // The command died of SIGPIPE because the reader left: not a failure.
+    assert!(entries(&s.data_dir()).is_empty(), "a marker was stored");
 }
 
 #[test]
@@ -674,4 +683,102 @@ fn an_inherited_ignored_sigchld_does_not_fake_a_failure() {
             "SIGCHLD is not ignored in the command: {mask}"
         );
     }
+}
+
+#[test]
+fn an_interrupt_the_command_traps_still_stores_nothing() {
+    use std::os::unix::process::CommandExt;
+    // terraform-style: the command traps SIGINT and exits 1 instead of dying
+    // of it, so only ck's own handler can tell interrupted from failed.
+    let s = Sandbox::new();
+    let flag = s.home().join("slow");
+    let script = format!(
+        "trap 'exit 1' INT; [ -f '{}' ] && sleep 5; echo hi",
+        flag.display()
+    );
+    let args = [
+        "run", "--ttl", "1s", "--stale", "1h", "--", "sh", "-c", &script,
+    ];
+    assert_eq!(code(&s.ck(&args).output().unwrap()), 0);
+    sleep(PAST_TTL);
+    fs::write(&flag, "").unwrap();
+    for round in 0..20 {
+        let child = s.ck(&args).process_group(0).spawn().unwrap();
+        sleep(Duration::from_millis(150));
+        let group = rustix::process::Pid::from_raw(child.id() as i32).unwrap();
+        rustix::process::kill_process_group(group, rustix::process::Signal::INT).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(code(&out), 128 + 2, "round {round}: {}", stderr(&out));
+    }
+    assert_eq!(entries(&s.data_dir()).len(), 1, "a marker was stored");
+}
+
+#[test]
+fn a_command_that_signals_itself_is_a_failure() {
+    // ck received nothing, so a command dead of its own signal failed: the
+    // stale value is served with exit 0 and a marker is set.
+    for sig in ["TERM", "INT", "HUP", "QUIT"] {
+        let s = Sandbox::new();
+        let flags = ["--ttl", "1s", "--stale", "1h"];
+        s.run(&flags);
+        sleep(PAST_TTL);
+        s.set("selfkill", sig);
+        let out = s.run(&flags);
+        assert_eq!(
+            (code(&out), stdout(&out)),
+            (0, "hello\n".into()),
+            "{sig}: {}",
+            stderr(&out)
+        );
+        assert_eq!(entries(&s.data_dir()).len(), 2, "{sig}: no marker was set");
+    }
+}
+
+#[test]
+fn sigterm_stops_ck_when_only_a_background_job_holds_stdout() {
+    let s = Sandbox::new();
+    let mut child = s
+        .ck(&["run", "--", "sh", "-c", "sleep 8 & echo hi"])
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    sleep(Duration::from_millis(400));
+    let started = Instant::now();
+    signal(&child, rustix::process::Signal::TERM);
+    // Time ck's own exit: the background sleep still holds the pipes.
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "ck waited for the background job"
+        );
+        sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status.code(), Some(128 + 15));
+}
+
+#[test]
+fn a_fifo_file_key_exits_125_without_hanging() {
+    let s = Sandbox::new();
+    fs::create_dir_all(s.config_dir()).unwrap();
+    let path = s.config_dir().join("file.key");
+    rustix::fs::mkfifoat(
+        rustix::fs::CWD,
+        &path,
+        rustix::fs::Mode::from_raw_mode(0o600),
+    )
+    .unwrap();
+    let mut child = s.ck(&["run", "--", "origin"]).spawn().unwrap();
+    let started = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "ck hung opening a FIFO key"
+        );
+        sleep(Duration::from_millis(50));
+    }
+    let out = child.wait_with_output().unwrap();
+    assert_eq!((code(&out), s.runs()), (125, 0), "{}", stderr(&out));
 }

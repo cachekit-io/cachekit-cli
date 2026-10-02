@@ -42,6 +42,7 @@ impl Store {
         // The file backend runs its I/O on tokio's blocking pool; a
         // current-thread runtime is the cheapest one that provides it.
         let runtime = tokio::runtime::Builder::new_current_thread()
+            .on_thread_start(crate::child::block_handled_signals)
             .build()
             .map_err(|e| Fatal(format!("cannot start the async runtime: {e}")))?;
         Ok(Self {

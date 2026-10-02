@@ -36,8 +36,8 @@ pub enum Ran {
     StatusUnknown {
         stdout: Stdout,
     },
-    /// ck received one of [`HANDLED`], or the command died of one. Nothing
-    /// is stored: the caller prints any captured output and exits 128 + n.
+    /// ck received one of [`HANDLED`]. Nothing is stored: the caller prints
+    /// any captured output and exits 128 + n.
     Interrupted {
         signal: i32,
         stdout: Stdout,
@@ -49,6 +49,19 @@ pub enum Stdout {
     Captured(Vec<u8>),
     /// Already written to ck's stdout.
     Written,
+    /// Being streamed when ck's reader went away. The pipe was dropped, so
+    /// the command most likely died of SIGPIPE, which says nothing about
+    /// the origin.
+    ReaderGone,
+}
+
+impl Stdout {
+    /// Print output that was held back; anything else is already out.
+    pub fn emit_captured(&self) {
+        if let Self::Captured(out) = self {
+            emit(out);
+        }
+    }
 }
 
 enum State {
@@ -105,11 +118,23 @@ impl Supervisor {
         std::thread::Builder::new()
             .name("signals".into())
             .spawn(move || {
+                block_handled_signals();
                 for sig in signals.forever() {
                     let state = thread_state.lock().unwrap_or_else(PoisonError::into_inner);
                     match *state {
                         State::Idle => std::process::exit(128 + sig),
-                        State::Running(pid) => forward(pid, sig),
+                        State::Running(pid) => {
+                            forward(pid, sig);
+                            // A command that has exited while a background
+                            // job still holds its stdout is only a zombie:
+                            // nothing is left to wait for.
+                            let exited = WaitIdOptions::EXITED
+                                | WaitIdOptions::NOWAIT
+                                | WaitIdOptions::NOHANG;
+                            if let Ok(Some(_)) = rustix::process::waitid(WaitId::Pid(pid), exited) {
+                                std::process::exit(128 + sig);
+                            }
+                        }
                     }
                 }
             })
@@ -191,12 +216,10 @@ impl Supervisor {
         let status = waited
             .map_err(std::io::Error::from)
             .and_then(|_| child.wait());
-        let died_of = status
-            .as_ref()
-            .ok()
-            .and_then(|s| s.signal())
-            .filter(|s| HANDLED.contains(s));
-        if let Some(signal) = self.received().or(died_of) {
+        // Only a signal ck itself received is an interruption. A command that
+        // dies of a signal on its own (`kill -INT $$`, `pkill op`) failed,
+        // and may be answered with stale output.
+        if let Some(signal) = self.received() {
             return Ran::Interrupted { signal, stdout };
         }
         let status = match status {
@@ -233,25 +256,30 @@ fn collect(mut pipe: impl Read) -> Stdout {
         };
         if buffer.len() + n > OUTPUT_CAP {
             warn("the command's output passed 20 MiB, so this run is not cached");
-            if emit(&buffer) && emit(&chunk[..n]) {
-                stream(pipe, &mut chunk);
+            if emit(&buffer) && emit(&chunk[..n]) && stream(pipe, &mut chunk) {
+                return Stdout::Written;
             }
-            return Stdout::Written;
+            return Stdout::ReaderGone;
         }
         buffer.extend_from_slice(&chunk[..n]);
     }
 }
 
-fn stream(mut pipe: impl Read, chunk: &mut [u8]) {
+/// Copy the rest of the pipe to stdout. Returns `false` if ck's own stdout
+/// failed first.
+fn stream(mut pipe: impl Read, chunk: &mut [u8]) -> bool {
     loop {
         let n = match pipe.read(chunk) {
-            Ok(0) => return,
+            Ok(0) => return true,
             Ok(n) => n,
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(e) => return warn(&format!("cannot read the command's output: {e}")),
+            Err(e) => {
+                warn(&format!("cannot read the command's output: {e}"));
+                return true;
+            }
         };
         if !emit(&chunk[..n]) {
-            return;
+            return false;
         }
     }
 }
@@ -265,10 +293,30 @@ fn forward(pid: Pid, sig: i32) {
     let _ = rustix::process::kill_process(pid, signal);
 }
 
+/// Block [`HANDLED`] on the calling thread. ck calls this on every thread it
+/// starts (the signal thread and tokio's blocking pool), so the kernel always
+/// runs their handlers on the main thread. A handler there finishes before
+/// the main thread's `read` or `waitid` returns, so `received` is always set
+/// before the main thread decides whether the run was interrupted.
+#[allow(unsafe_code)]
+pub(crate) fn block_handled_signals() {
+    // SAFETY: `sigemptyset` and `sigaddset` initialise a local set, and
+    // `pthread_sigmask` changes only the calling thread's mask. Its one
+    // failure, EINVAL, needs an invalid `how`, and SIG_BLOCK is valid.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        for sig in HANDLED {
+            libc::sigaddset(&mut set, sig);
+        }
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+    }
+}
+
 /// Whether `sig` is ignored, as inherited from ck's parent.
 ///
 /// No dependency offers a safe query of a signal's disposition, so this is
-/// one of ck's two `unsafe` blocks.
+/// one of ck's three `unsafe` blocks.
 #[allow(unsafe_code)]
 fn inherited_ignored(sig: i32) -> bool {
     // SAFETY: an all-zero `sigaction` is a valid value of the C struct, and

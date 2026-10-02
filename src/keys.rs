@@ -64,7 +64,9 @@ pub fn file_key(config_dir: &Path) -> Result<Vec<u8>, Fatal> {
     let open = || {
         fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            // O_NONBLOCK so a FIFO planted at the path cannot hang the open;
+            // the fstat below rejects anything but a regular file.
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
             .open(&path)
     };
     let mut file = match open() {
