@@ -127,13 +127,18 @@ log or environment dump from the command does not carry your keys.
 When ck itself receives SIGTERM, SIGHUP, SIGINT or SIGQUIT, the run is
 interrupted. ck forwards SIGTERM and SIGHUP to the command; SIGINT and SIGQUIT
 already reach it from the terminal. ck then waits for the command to exit, but
-not for a background job it left holding the output. A signal that arrives
-while the command runs discards the output ck was holding back, stores
-nothing, and makes ck exit 128 plus the number of the first signal it
-received. Output already written, by an uncached call or past 20 MiB, stays
-written, and a cache entry being written is never left half-written. Later
-SIGTERM and SIGHUP signals are still forwarded, so a command that handles the
-first one gracefully can still be stopped.
+not for a background job it left holding the output. Later SIGTERM and SIGHUP
+signals are still forwarded, so a command that handles the first one
+gracefully can still be stopped.
+
+An interrupted run discards the output ck was holding back, stores nothing,
+and exits 128 plus the number of the first signal ck received. Signals that
+arrive together count in signal-number order. Output already written, by an
+uncached call or past 20 MiB, stays written, and a cache entry being written
+is never left half-written. On a run streamed past 20 MiB, ck ends as soon as
+the command does, so the last part of the output it was still relaying can be
+cut off. A signal that lands in the millisecond or so while ck is starting the
+command is honoured only when the command exits.
 
 A command that dies of a signal ck did not receive, such as one that kills
 itself, has simply failed: ck backs off and serves stored output as for any

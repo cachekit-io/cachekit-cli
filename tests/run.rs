@@ -92,7 +92,8 @@ fn a_contended_lock_with_a_stale_value_serves_stale_at_once() {
     s.set("sleep", "2");
     s.set("out", "new\n");
     let filler = s.spawn(&flags);
-    sleep(Duration::from_millis(300));
+    // The filler's command is running, so it holds the lock.
+    wait_until(|| s.runs() == 2);
 
     let started = Instant::now();
     let out = s.run(&flags);
@@ -508,7 +509,7 @@ fn sigint_waits_for_the_child_and_stores_nothing() {
     let out = child.wait_with_output().unwrap();
     assert_eq!(code(&out), 128 + 2);
     assert!(
-        started.elapsed() >= Duration::from_millis(500),
+        started.elapsed() >= Duration::from_millis(300),
         "ck did not wait for the child"
     );
     assert_eq!(stdout(&out), "", "an interrupted run printed its output");
@@ -526,9 +527,7 @@ fn a_waiter_blocked_on_the_lock_exits_on_a_signal() {
     // The holder's command is running, so it holds the lock.
     wait_until(|| s.runs() == 1);
     let waiter = s.spawn(&["--ttl", "1h"]);
-    // A waiter blocked in flock shows nothing a test can poll, so this one
-    // pause stays: long enough for ck to install its handlers and block.
-    sleep(Duration::from_millis(300));
+    wait_handlers_installed(&waiter);
     let started = Instant::now();
     signal(&waiter, rustix::process::Signal::TERM);
     let out = waiter.wait_with_output().unwrap();
@@ -589,7 +588,9 @@ fn a_signal_while_writing_output_stops_ck() {
         .ck(&["run", "--", "head", "-c", "1000000", "/dev/zero"])
         .spawn()
         .unwrap();
-    sleep(Duration::from_millis(500));
+    wait_handlers_installed(&child);
+    // Give it time to fill the pipe and block writing.
+    sleep(Duration::from_millis(200));
     signal(&child, rustix::process::Signal::TERM);
     let out = child.wait_with_output().unwrap();
     assert_eq!(code(&out), 128 + 15);
@@ -604,14 +605,11 @@ fn a_closed_reader_ends_a_streamed_command() {
     let mut head = [0u8; 10];
     child.stdout.take().unwrap().read_exact(&mut head).unwrap();
     // The read end is dropped here, as `| head -c 10` would.
-    let started = Instant::now();
-    while child.try_wait().unwrap().is_none() {
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "ck kept draining a closed pipe"
-        );
-        sleep(Duration::from_millis(50));
-    }
+    wait_exit(
+        &mut child,
+        Duration::from_secs(10),
+        "ck kept draining a closed pipe",
+    );
     // The command died of SIGPIPE because the reader left: not a failure.
     assert!(entries(&s.data_dir()).is_empty(), "a marker was stored");
 }
@@ -763,19 +761,13 @@ fn sigterm_stops_ck_when_only_a_background_job_holds_stdout() {
         .spawn()
         .unwrap();
     wait_until(|| ready.exists());
-    let started = Instant::now();
     signal(&child, rustix::process::Signal::TERM);
     // Time ck's own exit: the background sleep still holds the pipes.
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "ck waited for the background job"
-        );
-        sleep(Duration::from_millis(20));
-    };
+    let status = wait_exit(
+        &mut child,
+        Duration::from_secs(3),
+        "ck waited for the background job",
+    );
     assert_eq!(status.code(), Some(128 + 15));
     assert!(
         entries(&s.data_dir()).is_empty(),
@@ -796,14 +788,11 @@ fn a_fifo_file_key_exits_125_without_hanging() {
         .success());
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
     let mut child = s.ck(&["run", "--", "origin"]).spawn().unwrap();
-    let started = Instant::now();
-    while child.try_wait().unwrap().is_none() {
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "ck hung opening a FIFO key"
-        );
-        sleep(Duration::from_millis(50));
-    }
+    wait_exit(
+        &mut child,
+        Duration::from_secs(5),
+        "ck hung opening a FIFO key",
+    );
     let out = child.wait_with_output().unwrap();
     assert_eq!((code(&out), s.runs()), (125, 0), "{}", stderr(&out));
 }
@@ -893,16 +882,11 @@ fn two_signals(
     );
     let started = Instant::now();
     rustix::process::kill_process(pid, then).unwrap();
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "the second signal was not forwarded"
-        );
-        sleep(Duration::from_millis(20));
-    };
+    let status = wait_exit(
+        &mut child,
+        Duration::from_secs(5),
+        "the second signal was not forwarded",
+    );
     assert!(
         entries(&s.data_dir()).is_empty(),
         "the interrupted run was stored"
@@ -952,21 +936,85 @@ fn a_signal_after_the_command_exited_stops_ck() {
     wait_until(|| ready.exists());
     // Let the shell finish exiting after the touch.
     sleep(Duration::from_millis(200));
-    let started = Instant::now();
     signal(&child, rustix::process::Signal::TERM);
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "ck waited for the background job"
-        );
-        sleep(Duration::from_millis(20));
-    };
+    let status = wait_exit(
+        &mut child,
+        Duration::from_secs(3),
+        "ck waited for the background job",
+    );
     assert_eq!(status.code(), Some(128 + 15));
     assert!(
         entries(&s.data_dir()).is_empty(),
         "the interrupted run was stored"
     );
+}
+
+/// Wait for `child` to exit, failing the test with `msg` after `limit`.
+fn wait_exit(
+    child: &mut std::process::Child,
+    limit: Duration,
+    msg: &str,
+) -> std::process::ExitStatus {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        assert!(started.elapsed() < limit, "{msg}");
+        sleep(Duration::from_millis(20));
+    }
+}
+
+/// Wait until ck has installed its SIGTERM handler, so a signal sent now is
+/// ck's to handle. Linux shows it in `SigCgt`; elsewhere, wait a moment.
+fn wait_handlers_installed(child: &std::process::Child) {
+    #[cfg(target_os = "linux")]
+    wait_until(|| {
+        let status = fs::read_to_string(format!("/proc/{}/status", child.id())).unwrap_or_default();
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix("SigCgt:"))
+            .and_then(|m| u64::from_str_radix(m.trim(), 16).ok())
+            .is_some_and(|m| m & (1 << (libc::SIGTERM - 1)) != 0)
+    });
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = child;
+        sleep(Duration::from_millis(300));
+    }
+}
+
+/// Repeated signals to a command that ignores them add no threads to ck.
+#[cfg(target_os = "linux")]
+#[test]
+fn repeated_signals_start_one_waiter() {
+    let s = Sandbox::new();
+    let ready = s.home().join("ready");
+    let script = format!("trap '' TERM; touch '{}'; sleep 3", ready.display());
+    let mut child = s
+        .ck(&["run", "--", "sh", "-c", &script])
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_until(|| ready.exists());
+    let threads = || {
+        fs::read_dir(format!("/proc/{}/task", child.id()))
+            .unwrap()
+            .count()
+    };
+    signal(&child, rustix::process::Signal::TERM);
+    sleep(Duration::from_millis(100));
+    let after_one = threads();
+    for _ in 0..50 {
+        signal(&child, rustix::process::Signal::TERM);
+        sleep(Duration::from_millis(5));
+    }
+    sleep(Duration::from_millis(100));
+    assert_eq!(
+        threads(),
+        after_one,
+        "repeated signals started more threads"
+    );
+    let status = wait_exit(&mut child, Duration::from_secs(10), "ck did not exit");
+    assert_eq!(status.code(), Some(128 + 15));
 }

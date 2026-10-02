@@ -94,7 +94,7 @@ pub struct Supervisor {
     /// main thread can reap a child killed by the same process-group signal.
     /// It holds the latest signal.
     received: Arc<AtomicUsize>,
-    /// The first signal, recorded once by the signal thread. Every path that
+    /// The first signal, recorded once, normally by the signal thread. Every path that
     /// ends ck on a signal exits 128 + this, so two signals in a row give one
     /// deterministic exit code.
     first: Arc<AtomicUsize>,
@@ -132,14 +132,16 @@ impl Supervisor {
                 for sig in signals.forever() {
                     let state = thread_state.lock().unwrap_or_else(PoisonError::into_inner);
                     match *state {
-                        State::Idle => std::process::exit(128 + record_first(&thread_first, sig)),
+                        State::Idle => std::process::exit(128 + record_first(&thread_first, sig).0),
                         State::Running(pid) => {
                             // Every TERM and HUP is forwarded, under the lock
                             // so the pid cannot be reaped and reused first: a
                             // command that traps the first one still gets the
                             // supervisor's next.
                             forward(pid, sig);
-                            if record_first(&thread_first, sig) == sig {
+                            // Only the call that records the first signal
+                            // starts the waiter: repeats must not add threads.
+                            if record_first(&thread_first, sig).1 {
                                 wait_then_exit(pid, Arc::clone(&thread_first));
                             }
                         }
@@ -203,7 +205,7 @@ impl Supervisor {
                 _ => std::thread::sleep(Duration::from_millis(1)),
             }
         }
-        Some(record_first(&self.first, latest))
+        Some(record_first(&self.first, latest).0)
     }
 
     /// Run `argv` with every `CACHEKIT_*` variable removed from its
@@ -230,6 +232,15 @@ impl Supervisor {
             // Held across the spawn so a signal cannot fall between "no
             // child yet" and "child running".
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            // A signal that arrived while this thread held the lock found the
+            // signal thread blocked on it: honour it now, before any command
+            // starts. One that lands inside `spawn` itself is honoured only
+            // when the command exits; see the README.
+            if let Some(signal) = self.received() {
+                return Ran::Interrupted {
+                    signal: record_first(&self.first, signal).0,
+                };
+            }
             match command.spawn() {
                 Ok(child) => {
                     *state = State::Running(pid_of(child.id()));
@@ -336,13 +347,14 @@ fn stream(mut pipe: impl Read, chunk: &mut [u8]) -> bool {
     }
 }
 
-/// Record `sig` as the first signal unless one already is; return the first.
-fn record_first(first: &AtomicUsize, sig: i32) -> i32 {
+/// Record `sig` as the first signal unless one already is. Returns the first
+/// signal, and whether this call is the one that recorded it.
+fn record_first(first: &AtomicUsize, sig: i32) -> (i32, bool) {
     let value =
         usize::try_from(sig).unwrap_or_else(|_| unreachable!("signal numbers are positive"));
     match first.compare_exchange(0, value, Ordering::SeqCst, Ordering::SeqCst) {
-        Ok(_) => sig,
-        Err(prev) => i32::try_from(prev).unwrap_or(sig),
+        Ok(_) => (sig, true),
+        Err(prev) => (i32::try_from(prev).unwrap_or(sig), false),
     }
 }
 
