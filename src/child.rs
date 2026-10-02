@@ -257,7 +257,7 @@ impl Supervisor {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             // A signal that arrived while this thread held the lock found the
             // signal thread blocked on it: start no command. Release the lock
-            // so the signal thread, which sees signals in order, decides the
+            // so the signal thread decides the
             // exit code. A SIGINT or SIGQUIT that lands inside `spawn` itself
             // may not reach the command; ck still exits 128 + n when the
             // command exits. A TERM or HUP there is forwarded once `spawn`
@@ -275,15 +275,23 @@ impl Supervisor {
                 }
                 Err(e) => {
                     let name = argv[0].to_string_lossy();
-                    return Ran::SpawnFailed {
-                        code: if e.kind() == ErrorKind::NotFound {
-                            warn(&format!("{name}: command not found"));
-                            127
-                        } else {
-                            warn(&format!("{name}: cannot run it: {e}"));
-                            126
-                        },
+                    let code = if e.kind() == ErrorKind::NotFound {
+                        warn(&format!("{name}: command not found"));
+                        127
+                    } else {
+                        warn(&format!("{name}: cannot run it: {e}"));
+                        126
                     };
+                    // A signal ck already received wins over the spawn
+                    // failure. Release the lock first: the signal thread
+                    // records the signal under it.
+                    drop(state);
+                    if let Some(latest) = self.received() {
+                        return Ran::Interrupted {
+                            signal: self.settle_first(latest),
+                        };
+                    }
+                    return Ran::SpawnFailed { code };
                 }
             }
         };

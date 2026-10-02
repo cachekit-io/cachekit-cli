@@ -80,9 +80,9 @@ impl Call<'_> {
         };
 
         let supervisor = Supervisor::install()?;
-        // From here a signal is ck's to answer. Each return below that runs
-        // no command first checks for one already received, so it is never
-        // ignored or answered alongside served output.
+        // From here a signal is ck's to answer. Each return below that serves
+        // stored output or is suppressed first checks for one already
+        // received, so it is never ignored or answered alongside output.
         // Another process holding the lock is filling. Serve what we have
         // rather than wait; with nothing servable, wait for its result.
         let lock = match fill_lock(&self.lock_path, stale.is_none()) {
@@ -159,10 +159,8 @@ impl Call<'_> {
         let (code, stdout) = match supervisor.run(&self.args.command, true) {
             Ran::SpawnFailed { code } => {
                 // The command never started, so the origin was not reached:
-                // no marker is set or bumped.
-                if let Some(code) = supervisor.interrupted() {
-                    return code;
-                }
+                // no marker is set or bumped. `Supervisor::run` has already
+                // turned a received signal into `Interrupted`.
                 return match stale {
                     Some(stale) => self.serve_stale(&stale, None, None),
                     None => code,
