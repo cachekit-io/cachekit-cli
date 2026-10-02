@@ -35,11 +35,13 @@ pub fn master_key(config_dir: &Path) -> Result<Vec<u8>, Fatal> {
 fn decode_master_key(hex_key: &OsString) -> Result<Vec<u8>, Fatal> {
     let bad = || {
         Fatal(format!(
-            "{MASTER_KEY_ENV} must be at least 32 bytes, hex-encoded (generate one with `openssl rand -hex 32`)"
+            "{MASTER_KEY_ENV} must be exactly 32 bytes, hex-encoded (generate one with `openssl rand -hex 32`)"
         ))
     };
     let bytes = hex::decode(hex_key.as_bytes()).map_err(|_| bad())?;
-    if bytes.len() < 32 {
+    // Exactly 32: the one length every SDK accepts, and the only one
+    // `EncryptionLayer::new` takes since cachekit-rs 0.9.
+    if bytes.len() != 32 {
         return Err(bad());
     }
     Ok(bytes)
@@ -243,6 +245,7 @@ mod tests {
     fn master_key_hex() {
         assert!(decode_master_key(&"ab".repeat(32).into()).is_ok());
         assert!(decode_master_key(&"ab".repeat(31).into()).is_err());
+        assert!(decode_master_key(&"ab".repeat(33).into()).is_err());
         assert!(decode_master_key(&"zz".repeat(32).into()).is_err());
     }
 }

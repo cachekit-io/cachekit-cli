@@ -113,7 +113,7 @@ To stop serving old output:
 
 Entries are encrypted with AES-256-GCM, and their file names are keyed hashes,
 so neither the output nor the command line appears on disk. The key comes from
-`CACHEKIT_MASTER_KEY` (hex, an even number of characters and at least 64) if
+`CACHEKIT_MASTER_KEY` (exactly 64 hex characters, from `openssl rand -hex 32`) if
 it is set. Otherwise ck
 creates a random key in `~/.config/ck/file.key` on first use, mode 0600. If
 that file is damaged, ck exits 125 and tells you to delete it; it never
