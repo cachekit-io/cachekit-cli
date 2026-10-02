@@ -949,7 +949,8 @@ fn a_signal_after_the_command_exited_stops_ck() {
     );
 }
 
-/// Wait for `child` to exit, failing the test with `msg` after `limit`.
+/// Wait for `child` to exit, failing the test with `msg` after `limit`; the
+/// child is killed first, so a failure leaves no process behind.
 fn wait_exit(
     child: &mut std::process::Child,
     limit: Duration,
@@ -960,7 +961,12 @@ fn wait_exit(
         if let Some(status) = child.try_wait().unwrap() {
             return status;
         }
-        assert!(started.elapsed() < limit, "{msg}");
+        if started.elapsed() >= limit {
+            // Never leave a failing test's process running.
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{msg}");
+        }
         sleep(Duration::from_millis(20));
     }
 }
