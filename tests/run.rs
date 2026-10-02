@@ -523,8 +523,11 @@ fn a_waiter_blocked_on_the_lock_exits_on_a_signal() {
     let s = Sandbox::new();
     s.set("sleep", "3");
     let holder = s.spawn(&["--ttl", "1h"]);
-    sleep(Duration::from_millis(300));
+    // The holder's command is running, so it holds the lock.
+    wait_until(|| s.runs() == 1);
     let waiter = s.spawn(&["--ttl", "1h"]);
+    // A waiter blocked in flock shows nothing a test can poll, so this one
+    // pause stays: long enough for ck to install its handlers and block.
     sleep(Duration::from_millis(300));
     let started = Instant::now();
     signal(&waiter, rustix::process::Signal::TERM);
