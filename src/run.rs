@@ -71,11 +71,18 @@ impl Call<'_> {
             Ok(v) => v,
             Err(e) => return self.read_failed(e, &Supervisor::install()?),
         };
-        let ControlFlow::Continue(stale) = self.fresh_or_stale(value) else {
-            return Ok(0);
+        let stale = match self.fresh_or_stale(value) {
+            ControlFlow::Break(fresh) => {
+                emit(&fresh);
+                return Ok(0);
+            }
+            ControlFlow::Continue(stale) => stale,
         };
 
         let supervisor = Supervisor::install()?;
+        // From here a signal is ck's to answer. Each return below that runs
+        // no command first checks for one already received, so it is never
+        // ignored or answered alongside served output.
         // Another process holding the lock is filling. Serve what we have
         // rather than wait; with nothing servable, wait for its result.
         let lock = match fill_lock(&self.lock_path, stale.is_none()) {
@@ -85,6 +92,9 @@ impl Call<'_> {
                     unreachable!("only a call with stale output skips the wait")
                 });
                 let marker = self.store.marker(&self.marker_key).ok().flatten();
+                if let Some(code) = supervisor.interrupted() {
+                    return Ok(code);
+                }
                 return Ok(self.serve_stale(&stale, marker.as_ref(), None));
             }
             Err(e) => {
@@ -104,11 +114,21 @@ impl Call<'_> {
             (Ok(v), Ok(m)) => (v, m),
             (Err(e), _) | (_, Err(e)) => return self.read_failed(e, &supervisor),
         };
-        let ControlFlow::Continue(stale) = self.fresh_or_stale(value) else {
-            return Ok(0);
+        let stale = match self.fresh_or_stale(value) {
+            ControlFlow::Break(fresh) => {
+                if let Some(code) = supervisor.interrupted() {
+                    return Ok(code);
+                }
+                emit(&fresh);
+                return Ok(0);
+            }
+            ControlFlow::Continue(stale) => stale,
         };
         let now = now_ms();
         if let Some(m) = marker.filter(|m| m.is_active(now)) {
+            if let Some(code) = supervisor.interrupted() {
+                return Ok(code);
+            }
             if let Some(stale) = stale {
                 return Ok(self.serve_stale(&stale, Some(&m), None));
             }
@@ -140,6 +160,9 @@ impl Call<'_> {
             Ran::SpawnFailed { code } => {
                 // The command never started, so the origin was not reached:
                 // no marker is set or bumped.
+                if let Some(code) = supervisor.interrupted() {
+                    return code;
+                }
                 return match stale {
                     Some(stale) => self.serve_stale(&stale, None, None),
                     None => code,
@@ -198,17 +221,14 @@ impl Call<'_> {
         }
     }
 
-    /// Print a fresh value and break, or continue with the stale run (if
+    /// Break with a fresh value to print, or continue with the stale run (if
     /// `--stale` still allows one) for the caller to fall back on.
-    fn fresh_or_stale(&self, value: Option<Envelope>) -> ControlFlow<(), Option<Stale>> {
+    fn fresh_or_stale(&self, value: Option<Envelope>) -> ControlFlow<Vec<u8>, Option<Stale>> {
         let Some(envelope) = value else {
             return ControlFlow::Continue(None);
         };
         match envelope.freshness(now_ms(), self.args.ttl_secs, self.args.stale_secs) {
-            Freshness::Fresh => {
-                emit(&envelope.stdout);
-                ControlFlow::Break(())
-            }
+            Freshness::Fresh => ControlFlow::Break(envelope.stdout),
             Freshness::Stale { age_ms } => ControlFlow::Continue(Some(Stale { envelope, age_ms })),
             Freshness::Expired => ControlFlow::Continue(None),
         }

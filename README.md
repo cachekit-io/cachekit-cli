@@ -132,8 +132,8 @@ signals are still forwarded, so a command that handles the first one
 gracefully can still be stopped.
 
 An interrupted run discards the output ck was holding back, stores nothing,
-and exits 128 plus the number of the first signal ck received. Signals that
-arrive together count in signal-number order. Output already written, by an
+and exits 128 plus the number of a signal it received; when several arrive
+close together, which one is unspecified. Output already written, by an
 uncached call or past 20 MiB, stays written, and a cache entry being written
 is never left half-written. On an interrupted run streamed past 20 MiB, ck
 ends as soon as the command does, so the last part of the output it was still

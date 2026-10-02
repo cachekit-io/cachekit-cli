@@ -40,7 +40,7 @@ pub enum Ran {
     /// ck received one of [`HANDLED`] while the command ran. Output ck was
     /// holding back is discarded and nothing is stored; output already
     /// written (an uncached call, or past the cap) stays written. The caller
-    /// exits 128 + n, where n is the first signal ck received.
+    /// exits 128 + n, where n is a signal ck received.
     Interrupted {
         signal: i32,
     },
@@ -82,7 +82,7 @@ enum State {
 /// from the terminal, and some programs treat a second interrupt as a hard
 /// abort. On any of them ck waits for the child to exit (not for whatever
 /// still holds its stdout), discards the output it held back, stores
-/// nothing, and exits 128 + n for the first signal. Later TERM and HUP
+/// nothing, and exits 128 + n for a signal it received. Later TERM and HUP
 /// signals are forwarded too.
 ///
 /// A signal ck inherited as ignored (`nohup`, a background job) is left
@@ -94,9 +94,10 @@ pub struct Supervisor {
     /// main thread can reap a child killed by the same process-group signal.
     /// It holds the latest signal.
     received: Arc<AtomicUsize>,
-    /// The first signal, recorded once, normally by the signal thread. Every path that
-    /// ends ck on a signal exits 128 + this, so two signals in a row give one
-    /// deterministic exit code.
+    /// The signal ck reports, recorded once, normally by the signal thread.
+    /// Every path that ends ck on a signal exits 128 + this, so they agree.
+    /// Which of several signals arriving close together it is, is
+    /// unspecified.
     first: Arc<AtomicUsize>,
     /// SIGCHLD was inherited as ignored. ck handles it itself, or the kernel
     /// would reap the child before ck could read its exit status, and gives
@@ -164,6 +165,15 @@ impl Supervisor {
         })
     }
 
+    /// For a path that returns without running the command: the exit code
+    /// for a signal ck has already received, if any, so that the caller
+    /// prints nothing. A signal that arrives after this check is answered by
+    /// the signal thread, which ends ck even while it is still writing.
+    pub fn interrupted(&self) -> Option<i32> {
+        self.received()
+            .map(|latest| 128 + self.settle_first(latest))
+    }
+
     /// The latest handled signal ck received, if any.
     fn received(&self) -> Option<i32> {
         i32::try_from(self.received.load(Ordering::SeqCst))
@@ -200,16 +210,16 @@ impl Supervisor {
         None
     }
 
-    /// The signal that ends this run, once the child has exited: the first
-    /// one ck received.
+    /// The signal that ends this run, once the child has exited, if ck
+    /// received one.
     fn interrupted_by(&self, status: Option<&std::process::ExitStatus>) -> Option<i32> {
         let latest = self.received_after(status)?;
         Some(self.settle_first(latest))
     }
 
-    /// The first signal, as the signal thread records it. Every signal that
-    /// set the flag also reached that thread, so wait for its record; record
-    /// `latest` only as a backstop, if the thread has died.
+    /// The signal to report, as the signal thread records it. Every signal
+    /// that set the flag also reached that thread, so wait for its record;
+    /// record `latest` only as a backstop, if the thread has died.
     fn settle_first(&self, latest: i32) -> i32 {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {

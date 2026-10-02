@@ -1027,3 +1027,31 @@ fn repeated_signals_start_one_waiter() {
     let status = wait_exit(&mut child, Duration::from_secs(10), "ck did not exit");
     assert_eq!(status.code(), Some(128 + 15));
 }
+
+/// A signal that arrives while ck serves stored output into a full pipe still
+/// ends ck: a served value must never make ck unkillable.
+#[test]
+fn a_signal_while_serving_stale_output_stops_ck() {
+    let s = Sandbox::new();
+    let flags = ["--ttl", "1s", "--stale", "1h"];
+    // More than a pipe buffer, so the serve blocks on a reader that never reads.
+    s.set("out", &"x".repeat(1024 * 1024));
+    s.run(&flags);
+    sleep(PAST_TTL);
+    s.set("sleep", "5");
+    let mut filler = s.spawn(&flags);
+    wait_until(|| s.runs() == 2);
+    // The lock is contended and the value is stale: ck serves it at once.
+    let mut server = s.spawn(&flags);
+    wait_handlers_installed(&server);
+    sleep(Duration::from_millis(200));
+    signal(&server, rustix::process::Signal::TERM);
+    let status = wait_exit(
+        &mut server,
+        Duration::from_secs(3),
+        "ck kept blocking on the write",
+    );
+    assert_eq!(status.code(), Some(128 + 15));
+    let _ = filler.kill();
+    let _ = filler.wait();
+}
