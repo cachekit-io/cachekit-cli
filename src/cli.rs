@@ -11,12 +11,14 @@ use std::ffi::OsString;
 pub const MAX_RETENTION_SECS: u64 = 30 * 86_400;
 
 pub const USAGE: &str = "\
-usage: ck run [--backend file] [--ttl D] [--stale D] [--scope S] [--refresh] -- <command> [args...]
+usage: ck run [--backend file|saas] [--ttl D] [--stale D] [--scope S] [--refresh] -- <command> [args...]
 
 Runs <command> and caches its stdout when it exits 0. Only a call whose stdin
 is /dev/null is cached, so end every cached call with `< /dev/null`.
 
-  --backend file  where entries live (default: file, in ~/.cache/ck)
+  --backend B     where entries live: file (default, in ~/.cache/ck) or saas
+                  (CacheKit, shared across hosts; needs CACHEKIT_API_KEY and
+                  CACHEKIT_MASTER_KEY)
   --ttl D         serve the stored output as fresh for D (default: 60s)
   --stale D       after that, serve it for D more if the command fails (default: 0s)
   --scope S       an extra string folded into the cache key
@@ -27,6 +29,7 @@ D is a whole number followed by s, m, h or d, such as 90s, 15m, 12h or 7d.";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
     File,
+    Saas,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -93,10 +96,8 @@ fn parse_run(mut args: impl Iterator<Item = OsString>) -> Result<Invocation, Str
             "--backend" => {
                 backend = match value()?.to_str() {
                     Some("file") => BackendKind::File,
-                    Some("saas") => {
-                        return Err("--backend saas is not available in this release".into())
-                    }
-                    _ => return Err("--backend must be file".into()),
+                    Some("saas") => BackendKind::Saas,
+                    _ => return Err("--backend must be file or saas".into()),
                 }
             }
             "--ttl" => ttl_secs = duration(&value()?, name)?,
@@ -204,13 +205,20 @@ mod tests {
     }
 
     #[test]
+    fn the_backend_is_file_unless_saas_is_asked_for() {
+        assert_eq!(run(&["--", "x"]).unwrap().backend, BackendKind::File);
+        let r = run(&["--backend=saas", "--", "x"]).unwrap();
+        assert_eq!(r.backend, BackendKind::Saas);
+    }
+
+    #[test]
     fn limits() {
         assert!(run(&["--ttl", "0s", "--", "x"]).is_err());
         assert!(run(&["--ttl", "29d", "--stale", "1d", "--", "x"]).is_ok());
         assert!(run(&["--ttl", "29d", "--stale", "1d", "--stale", "86401s", "--", "x"]).is_err());
         assert!(run(&["--"]).is_err());
         assert!(run(&["--bogus", "--", "x"]).is_err());
-        assert!(run(&["--backend", "saas", "--", "x"]).is_err());
+        assert!(run(&["--backend", "redis", "--", "x"]).is_err());
         assert!(run(&["--refresh=yes", "--", "x"]).is_err());
     }
 }

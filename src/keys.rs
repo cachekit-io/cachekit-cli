@@ -32,7 +32,7 @@ pub fn master_key(config_dir: &Path) -> Result<Vec<u8>, Fatal> {
     file_key(config_dir)
 }
 
-fn decode_master_key(hex_key: &OsString) -> Result<Vec<u8>, Fatal> {
+pub(crate) fn decode_master_key(hex_key: &std::ffi::OsStr) -> Result<Vec<u8>, Fatal> {
     let bad = || {
         Fatal(format!(
             "{MASTER_KEY_ENV} must be exactly 32 bytes, hex-encoded (generate one with `openssl rand -hex 32`)"
@@ -243,9 +243,10 @@ mod tests {
 
     #[test]
     fn master_key_hex() {
-        assert!(decode_master_key(&"ab".repeat(32).into()).is_ok());
-        assert!(decode_master_key(&"ab".repeat(31).into()).is_err());
-        assert!(decode_master_key(&"ab".repeat(33).into()).is_err());
-        assert!(decode_master_key(&"zz".repeat(32).into()).is_err());
+        let decode = |hex: String| decode_master_key(hex.as_ref());
+        assert!(decode("ab".repeat(32)).is_ok());
+        assert!(decode("ab".repeat(31)).is_err());
+        assert!(decode("ab".repeat(33)).is_err());
+        assert!(decode("zz".repeat(32)).is_err());
     }
 }

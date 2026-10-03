@@ -1,4 +1,5 @@
-//! Every `sh` example in the README runs as written.
+//! Every `sh` example in the README runs as written. Those that use
+//! `--backend saas` run in tests/saas.rs, against a fake CacheKit.
 
 mod common;
 
@@ -7,12 +8,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
-use common::{code, stderr, Sandbox, BIN};
+use common::{code, readme_sh_blocks, stderr, Sandbox, BIN};
 
 #[test]
 fn readme_examples_run() {
-    let readme = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md")).unwrap();
-    let examples = sh_blocks(&readme);
+    let examples = readme_sh_blocks();
     assert!(
         examples.len() >= 4,
         "found only {} examples",
@@ -34,6 +34,10 @@ fn readme_examples_run() {
                 "a ck run call without the redirect:\n{example}"
             );
         }
+        // tests/saas.rs runs these against its fake CacheKit.
+        if example.contains("--backend saas") {
+            continue;
+        }
         let path = std::env::join_paths(
             [s.bin().as_path(), ck_dir]
                 .into_iter()
@@ -51,24 +55,4 @@ fn readme_examples_run() {
             .unwrap();
         assert_eq!(code(&out), 0, "{example}\n{}", stderr(&out));
     }
-}
-
-fn sh_blocks(markdown: &str) -> Vec<String> {
-    let mut blocks = Vec::new();
-    let mut current: Option<String> = None;
-    for line in markdown.lines() {
-        match (&mut current, line.trim_end()) {
-            (None, "```sh") => current = Some(String::new()),
-            (Some(block), "```") => {
-                blocks.push(std::mem::take(block));
-                current = None;
-            }
-            (Some(block), text) => {
-                block.push_str(text);
-                block.push('\n');
-            }
-            (None, _) => {}
-        }
-    }
-    blocks
 }

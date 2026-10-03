@@ -7,7 +7,13 @@ allow = ["MIT", "Apache-2.0", "BSD-3-Clause", "BSL-1.0", "ISC", "Unicode-3.0"]
 # cbindgen is an unconditional build dependency of cachekit-core that its
 # build script uses only under the `ffi` feature, which ck does not enable.
 # It runs at build time and none of its code is linked into ck.
-exceptions = [{ crate = "cbindgen", allow = ["MPL-2.0"] }]
+#
+# webpki-roots is the Mozilla root-certificate bundle that the SaaS backend's
+# TLS client trusts. It is data, not code, under a permissive data licence.
+exceptions = [
+    { crate = "cbindgen", allow = ["MPL-2.0"] },
+    { crate = "webpki-roots", allow = ["CDLA-Permissive-2.0"] },
+]
 
 [bans]
 wildcards = "deny"

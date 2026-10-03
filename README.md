@@ -25,7 +25,7 @@ serving a revoked secret (see [How long a cached secret lives](#how-long-a-cache
 Assigning before exporting keeps ck's exit code visible to the shell.
 
 ```text
-ck run [--backend file] [--ttl D] [--stale D] [--scope S] [--refresh] -- <command> [args...]
+ck run [--backend file|saas] [--ttl D] [--stale D] [--scope S] [--refresh] -- <command> [args...]
 ```
 
 | Flag | Default | Meaning |
@@ -34,7 +34,7 @@ ck run [--backend file] [--ttl D] [--stale D] [--scope S] [--refresh] -- <comman
 | `--stale D` | `0s` | After that, serve it for `D` more when the command fails. |
 | `--scope S` | empty | A string folded into the cache key (see below). |
 | `--refresh` | off | Run the command now and store the result, ignoring what is stored. |
-| `--backend file` | `file` | Entries live in `~/.cache/ck`. It is the only backend in this release. |
+| `--backend B` | `file` | `file` keeps entries in `~/.cache/ck`. `saas` keeps them in CacheKit, shared across hosts (see [Sharing a cache across hosts](#sharing-a-cache-across-hosts)). |
 
 A duration `D` is a whole number followed by one unit: `s`, `m`, `h` or `d`,
 such as `90s`, `15m`, `12h` or `7d`. `--ttl` plus `--stale` may not exceed
@@ -60,7 +60,9 @@ ck run --refresh -- date -u < /dev/null
 
 Concurrent calls for the same command on one machine run it once: the first
 takes a lock and the rest wait for its result, or serve stale output if they
-have it. Output larger than 20 MiB is passed through and not cached.
+have it. Output larger than 20 MiB is passed through and not cached. With
+`--backend saas` the backoff is shared by every host, but the lock is not, so
+hosts that miss at the same moment each run the command.
 
 ### stdin must be `/dev/null`
 
@@ -107,7 +109,9 @@ To stop serving old output:
 - lower `--stale` or `--ttl`, which takes effect on the next call;
 - delete `~/.cache/ck` to remove every entry;
 - delete `~/.config/ck/file.key`, or change `CACHEKIT_MASTER_KEY` if you set
-  one, to make every stored entry unreadable.
+  one, to make every stored entry unreadable. This is the purge for
+  `--backend saas`: a new master key moves every host to a fresh set of
+  entries at once.
 
 ### Encryption and the file key
 
@@ -123,6 +127,72 @@ warning.
 
 ck removes every `CACHEKIT_*` variable from the command's environment, so a
 log or environment dump from the command does not carry your keys.
+
+### Sharing a cache across hosts
+
+`--backend saas` keeps entries in [CacheKit](https://cachekit.io), so a laptop
+and a CI runner that run the same command share one result. ck uses it only
+when you pass `--backend saas`; setting `CACHEKIT_API_KEY` alone never selects
+it. It needs two variables:
+
+- `CACHEKIT_API_KEY`: an SDK API key (`ck_sdk_...`) or a `ck_live_` key from
+  the CacheKit dashboard. ck stores its entries in the `ck-run` namespace,
+  which a `ck_api_` key cannot write, so ck refuses one with exit 125. A key
+  limited to named namespaces must be granted `ck-run`.
+- `CACHEKIT_MASTER_KEY`: 64 hex characters from `openssl rand -hex 32`. It
+  encrypts every entry before it leaves the machine and keys every entry's
+  name, so CacheKit stores only ciphertext under names it cannot reverse.
+  Without it, ck exits 125 before running anything. It never falls back to
+  the file key.
+
+Give every host that shares the cache the same two values:
+
+```sh
+ck run --backend saas --ttl 12h --stale 1d -- date -u +%F < /dev/null
+```
+
+**The master key is the trust boundary.** Every host that holds it can store
+output that every other holder will then serve as the command's result.
+Encryption keeps the output from CacheKit, but it does not tell one holder's
+output from another's, and `--scope` does not separate holders either. So:
+
+- use one master key per group of machines that already trust each other;
+- never give it to a runner that executes untrusted code, such as a build of
+  a pull request from a fork;
+- never `eval` or execute shared output unless every holder of the key may
+  already run code on the machine that consumes it.
+
+**A CacheKit fault never stops your command.** When CacheKit cannot answer, or
+answers with an error, ck runs the command uncached and prints one warning
+naming the cause. That covers an outage, a timeout, and a rejected key
+(revoked, rotated or missing the `ck-run` grant), whose warning also names the
+fix. Each request to CacheKit gets 1 second: a call adds at most 1 second when
+CacheKit is down, and a first call that stores its output adds at most 3. On a
+link where requests routinely take longer than that, every call warns and
+nothing is cached; use the file backend there. The cost of carrying on is the
+quota caching was saving you: while the fault lasts, every call reaches the
+command's origin. An outage ends by itself, but a bad key lasts until someone
+fixes it, so against a daily quota it can use up the rest of the day. Watch
+for the warning.
+
+**Keep the clocks in sync.** Each call judges an entry's age by its own clock
+against the time the writing host recorded. A writer whose clock runs behind
+makes entries look older, so they refresh early. A writer whose clock runs
+ahead makes them look fresh for longer, by up to the difference, until
+CacheKit expires them at `--ttl` plus `--stale` after they were written.
+
+**What CacheKit receives.** Each request carries the API key, the entry's
+keyed name, and for a write the encrypted entry and its lifetime. A command's
+failure record is stored beside its output, under the same name plus `:neg`.
+So CacheKit can see how many entries you have, their sizes and lifetimes, when
+each is read and written, and which commands have a recorded failure, but
+neither the commands nor their output. The CacheKit client also sends three
+headers on every request, which ck cannot turn off: `X-CacheKit-Session-ID`, a
+random identifier for each ck process; `X-CacheKit-Session-Start`, when that
+process began; and `X-CacheKit-L1-Status: disabled`. Requests go through the
+proxy in `HTTPS_PROXY` when it is set. ck always talks to
+`https://api.cachekit.io`, and ignores `CACHEKIT_API_URL`, so a project's
+environment cannot send your key elsewhere.
 
 ### Signals
 

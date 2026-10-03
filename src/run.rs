@@ -15,13 +15,20 @@ use std::time::Duration;
 use rustix::fs::{FlockOperation, Mode, OFlags};
 
 use crate::child::{Ran, Stdout, Supervisor};
-use crate::cli::RunArgs;
+use crate::cli::{BackendKind, RunArgs};
 use crate::entry::{human, now_ms, Envelope, Freshness, Marker};
 use crate::keys::{self, KeyHasher};
+use crate::saas::{self, Connect};
 use crate::store::{ReadError, Store};
 use crate::{emit, warn, Fatal};
 
-pub fn run(args: &RunArgs) -> Result<i32, Fatal> {
+pub fn run(args: &RunArgs, connect: &Connect) -> Result<i32, Fatal> {
+    // saas credentials are checked first, so a saas call without them exits
+    // 125 whatever its stdin, before anything runs.
+    let credentials = match args.backend {
+        BackendKind::File => None,
+        BackendKind::Saas => Some(saas::credentials()?),
+    };
     if let Some(kind) = uncacheable_stdin() {
         warn(&format!(
             "stdin is {kind}, so this call is not cached. End the command with `< /dev/null` to cache it"
@@ -33,11 +40,23 @@ pub fn run(args: &RunArgs) -> Result<i32, Fatal> {
         .filter(|h| !h.is_empty())
         .map(PathBuf::from)
         .ok_or_else(|| Fatal("HOME is not set".into()))?;
-    let master_key = keys::master_key(&home.join(".config/ck"))?;
     let cache_dir = home.join(".cache/ck");
-    let store = Store::open_file(&cache_dir.join("data"), &master_key)?;
+    let (store, master_key) = match credentials {
+        None => {
+            let master_key = keys::master_key(&home.join(".config/ck"))?;
+            (
+                Store::open_file(&cache_dir.join("data"), &master_key)?,
+                master_key,
+            )
+        }
+        Some(c) => (
+            Store::open_saas(connect(&c.api_key)?, &c.master_key)?,
+            c.master_key,
+        ),
+    };
     let key = KeyHasher::new(&master_key)?.value_key(&args.scope, &args.command);
 
+    // The fill lock is host-local on every backend.
     let call = Call {
         args,
         marker_key: keys::marker_key(&key),
@@ -91,7 +110,16 @@ impl Call<'_> {
                 let stale = stale.unwrap_or_else(|| {
                     unreachable!("only a call with stale output skips the wait")
                 });
-                let marker = self.store.marker(&self.marker_key).ok().flatten();
+                // The marker only adds to the stderr line, so a failed read
+                // still serves stale: the lock holder is running the command.
+                let marker = match self.store.marker(&self.marker_key) {
+                    Ok(m) => m,
+                    Err(ReadError::Local(fatal)) => return Err(fatal),
+                    Err(ReadError::Backend(e)) => {
+                        warn(&format!("the cache is unavailable ({e})"));
+                        None
+                    }
+                };
                 if let Some(code) = supervisor.interrupted() {
                     return Ok(code);
                 }
@@ -107,12 +135,9 @@ impl Call<'_> {
         };
 
         // Holding the lock: whoever held it before may have filled the value.
-        let (value, marker) = match (
-            self.store.value(&self.key),
-            self.store.marker(&self.marker_key),
-        ) {
-            (Ok(v), Ok(m)) => (v, m),
-            (Err(e), _) | (_, Err(e)) => return self.read_failed(e, &supervisor),
+        let (value, marker) = match self.store.value_and_marker(&self.key, &self.marker_key) {
+            Ok(pair) => pair,
+            Err(e) => return self.read_failed(e, &supervisor),
         };
         let stale = match self.fresh_or_stale(value) {
             ControlFlow::Break(fresh) => {
@@ -149,7 +174,10 @@ impl Call<'_> {
     /// Never serves stale. The marker is read only to continue its count.
     fn refresh(&self) -> Result<i32, Fatal> {
         let supervisor = Supervisor::install()?;
-        let marker = self.store.marker(&self.marker_key).ok().flatten();
+        let marker = match self.store.marker(&self.marker_key) {
+            Ok(m) => m,
+            Err(e) => return self.read_failed(e, &supervisor),
+        };
         Ok(self.record(&supervisor, None, marker))
     }
 
@@ -181,18 +209,27 @@ impl Call<'_> {
 
         let now = now_ms();
         if code == 0 {
-            if let Stdout::Captured(out) = &stdout {
-                // Print before the write-back, so a pipeline sees output at once.
-                emit(out);
-                let ttl = Duration::from_secs(self.args.ttl_secs + self.args.stale_secs);
-                if let Err(e) = self.store.set(&self.key, &Envelope::encode(now, out), ttl) {
-                    warn(&format!(
-                        "the command succeeded but its output was not cached: {e}"
-                    ));
+            let envelope = match &stdout {
+                Stdout::Captured(out) => {
+                    // Print before the write-back, so a pipeline sees output at once.
+                    emit(out);
+                    Some(Envelope::encode(now, out))
                 }
-            }
-            // A success ends the backoff, whether or not its output was stored.
-            if let Err(e) = self.store.delete(&self.marker_key) {
+                _ => None,
+            };
+            let ttl = Duration::from_secs(self.args.ttl_secs + self.args.stale_secs);
+            // A success ends the backoff, whether or not its output is stored.
+            let (stored, cleared) = self.store.record_success(
+                &self.key,
+                envelope.as_deref().map(|e| (e, ttl)),
+                &self.marker_key,
+            );
+            // One warning: a failed write and a failed clear usually share a cause.
+            if let Err(e) = stored {
+                warn(&format!(
+                    "the command succeeded but its output was not cached: {e}"
+                ));
+            } else if let Err(e) = cleared {
                 warn(&format!("cannot clear the recorded failure: {e}"));
             }
             return 0;
