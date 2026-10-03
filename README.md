@@ -112,6 +112,13 @@ shell. Pass input in arguments, files or `--scope` instead. Programs that
 prompt by opening the terminal themselves, as `op`, `ssh` and `sudo` do, still
 reach you.
 
+A command that reads its input from stdin, such as `jq`, `envsubst` or
+`python3 -`, therefore reads nothing. If it still exits 0, ck caches that
+output like any other, with no warning: `curl -s "$URL" | ck run -- jq -r .token`
+caches an empty token. To cache a pipeline, wrap the command that produces the
+input instead: `ck run --ttl 5m -- curl -s "$URL" | jq -r .token` caches curl's
+output and runs `jq` on it every time.
+
 ### What the key does not cover
 
 The key is the command and its arguments, plus `--scope`. It does not cover
