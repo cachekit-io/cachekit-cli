@@ -3,8 +3,9 @@ name: Release
 # Every push to main runs release-please, which keeps a release PR open with
 # the next version and changelog. Merging that PR creates the tag and GitHub
 # Release, and the jobs below then attach attested binaries and publish the
-# crate to crates.io. A pushed tag releases nothing: tags the App creates do
-# not trigger workflows, so the whole release runs in this one workflow.
+# crate to crates.io. The release runs in this workflow, not on the tag, so
+# it never depends on a tag push starting a run, and a pushed tag releases
+# nothing.
 # Users verify a binary against this file's path and refs/heads/main, so
 # renaming the file or changing the trigger breaks the README's verify command.
 
