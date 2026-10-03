@@ -5,6 +5,32 @@ edition = "2021"
 description = "Command-line client for CacheKit"
 license = "MIT"
 repository = "https://github.com/cachekit-io/cachekit-cli"
+rust-version = "1.85"
+# Resolve dependency versions that build on rust-version, so the lockfile
+# keeps the MSRV promise that CI checks.
+resolver = "3"
+
+[[bin]]
+name = "ck"
+path = "src/main.rs"
 
 [lints.rust]
-unsafe_code = "forbid"
+# deny, not forbid: three audited blocks in src/child.rs read a signal's
+# inherited disposition, restore an ignored SIGCHLD in the child, and block
+# ck's handled signals on its helper threads. No dependency does these safely.
+unsafe_code = "deny"
+
+[dependencies]
+blake2 = "0.10"
+cachekit-core = { version = "0.6", default-features = false, features = ["encryption"] }
+cachekit-rs = { version = "0.9", default-features = false, features = ["encryption", "file"] }
+getrandom = "0.2"
+hex = "0.4"
+libc = "0.2"
+rustix = { version = "1", default-features = false, features = ["std", "fs", "process"] }
+signal-hook = "0.4"
+tokio = { version = "1", default-features = false, features = ["rt"] }
+
+[dev-dependencies]
+rustix = { version = "1", features = ["pty"] }
+tempfile = "3"

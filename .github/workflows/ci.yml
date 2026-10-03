@@ -83,7 +83,7 @@ jobs:
         run: |
           # grep exits 0 on a match, 1 on none, and 2 on error (a missing binary included).
           rc=0
-          grep -aoiE "$ADMIN_API_PATTERN" target/release/cachekit-cli || rc=$?
+          grep -aoiE "$ADMIN_API_PATTERN" target/release/ck || rc=$?
           if [ "$rc" -eq 0 ]; then
             echo "::error::admin API reference found in the release binary"
             exit 1
@@ -91,3 +91,23 @@ jobs:
             echo "::error::grep failed with exit code $rc"
             exit "$rc"
           fi
+
+      - name: Hit-path budget
+        # ck run -- true may add at most 5 ms over true, against a cache
+        # directory of about 10,000 entries.
+        run: cargo test --locked --release --test bench -- --ignored --nocapture
+
+  msrv:
+    name: msrv (1.85)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the rust-version toolchain
+        run: rustup toolchain install 1.85 --profile minimal
+
+      - name: Build on rust-version
+        run: cargo +1.85 check --locked --all-targets

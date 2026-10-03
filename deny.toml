@@ -2,10 +2,19 @@
 # cargo-deny cannot make: committed Cargo configs and versioned path deps.
 
 [licenses]
-allow = ["MIT"]
+# Permissive licences only, each one carried by the real dependency graph.
+allow = ["MIT", "Apache-2.0", "BSD-3-Clause", "BSL-1.0", "ISC", "Unicode-3.0"]
+# cbindgen is an unconditional build dependency of cachekit-core that its
+# build script uses only under the `ffi` feature, which ck does not enable.
+# It runs at build time and none of its code is linked into ck.
+exceptions = [{ crate = "cbindgen", allow = ["MPL-2.0"] }]
 
 [bans]
 wildcards = "deny"
+# ck has no HTTP client of its own: every network call goes through
+# cachekit-rs, whose request paths are fixed. A direct HTTP client
+# dependency fails here.
+deny = [{ crate = "reqwest", wrappers = ["cachekit-rs"] }]
 
 [sources]
 unknown-registry = "deny"
