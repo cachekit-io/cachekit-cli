@@ -85,6 +85,10 @@ const CASES: &[(&str, fn())] = &[
         an_api_key_alone_never_selects_saas,
     ),
     ("readme_saas_examples_run", readme_saas_examples_run),
+    (
+        "the_harness_reads_libtest_options",
+        the_harness_reads_libtest_options,
+    ),
 ];
 
 fn main() {
@@ -96,25 +100,113 @@ fn main() {
         std::process::exit(code);
     }
 
-    let filters: Vec<String> = std::env::args()
-        .skip(1)
-        .filter(|a| !a.starts_with('-'))
+    let args = Args::parse(std::env::args().skip(1)).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(101);
+    });
+    let selected: Vec<_> = CASES
+        .iter()
+        .filter(|(name, _)| args.selects(name))
         .collect();
-    let mut failed = Vec::new();
-    for (name, case) in CASES {
-        if !filters.is_empty() && !filters.iter().any(|f| name.contains(f.as_str())) {
-            continue;
+    if args.list {
+        for (name, _) in &selected {
+            println!("{name}: test");
         }
+        return;
+    }
+    let mut failed = Vec::new();
+    for (name, case) in &selected {
         println!("test {name} ...");
         if panic::catch_unwind(case).is_err() {
             failed.push(*name);
         }
     }
+    // As libtest does, a filter that matches nothing passes: `cargo test <filter>`
+    // hands the same filter to every test binary.
+    let counts = format!(
+        "{} passed; {} failed; {} filtered out",
+        selected.len() - failed.len(),
+        failed.len(),
+        CASES.len() - selected.len()
+    );
     if !failed.is_empty() {
         println!("FAILED: {}", failed.join(", "));
+        println!("test result: FAILED. {counts}");
         std::process::exit(101);
     }
-    println!("test result: ok");
+    println!("test result: ok. {counts}");
+}
+
+/// libtest's options, parsed so `cargo test`, nextest and IDEs select cases as
+/// they would under libtest. Options that only shape libtest's output, or its
+/// thread count, are accepted and ignored: the cases always run one at a time,
+/// because the timing cases assume nothing else is running.
+#[derive(Default)]
+struct Args {
+    filters: Vec<String>,
+    skips: Vec<String>,
+    exact: bool,
+    list: bool,
+    /// `--ignored` or `--bench`: no case is ignored or a benchmark.
+    none: bool,
+}
+
+impl Args {
+    fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
+        let mut parsed = Self::default();
+        let mut args = args.into_iter();
+        while let Some(arg) = args.next() {
+            // `--opt=value` is `--opt value`.
+            let (opt, mut inline) = match arg.split_once('=') {
+                Some((opt, value)) if opt.starts_with("--") => (opt, Some(value.to_owned())),
+                _ => (arg.as_str(), None),
+            };
+            let mut value = || {
+                inline
+                    .take()
+                    .or_else(|| args.next())
+                    .ok_or(format!("{opt} needs a value"))
+            };
+            match opt {
+                "--list" => parsed.list = true,
+                "--exact" => parsed.exact = true,
+                "--ignored" | "--bench" => parsed.none = true,
+                "--skip" => parsed.skips.push(value()?),
+                "--test-threads" | "--format" | "--color" | "--logfile" | "--shuffle-seed"
+                | "-Z" => {
+                    value()?;
+                }
+                "--include-ignored"
+                | "--test"
+                | "--nocapture"
+                | "--no-capture"
+                | "--show-output"
+                | "--quiet"
+                | "-q"
+                | "--report-time"
+                | "--ensure-time"
+                | "--shuffle"
+                | "--force-run-in-process"
+                | "--exclude-should-panic" => {}
+                _ if opt.starts_with('-') => return Err(format!("unrecognized option: {opt}")),
+                _ => parsed.filters.push(arg),
+            }
+        }
+        Ok(parsed)
+    }
+
+    fn selects(&self, name: &str) -> bool {
+        let matches = |pattern: &String| {
+            if self.exact {
+                name == pattern
+            } else {
+                name.contains(pattern.as_str())
+            }
+        };
+        !self.none
+            && (self.filters.is_empty() || self.filters.iter().any(matches))
+            && !self.skips.iter().any(matches)
+    }
 }
 
 // ── The fake backend ─────────────────────────────────────────────────────────
@@ -682,4 +774,45 @@ fn a_contended_lock_serves_stale_in_one_line() {
     assert!(warnings[0].contains("serving output from"), "{warnings:?}");
     assert!(warnings[0].contains("HTTP 503"), "{warnings:?}");
     assert_eq!(stdout(&filler.wait_with_output().unwrap()), "new\n");
+}
+
+fn the_harness_reads_libtest_options() {
+    let all: Vec<&str> = CASES.iter().map(|(name, _)| *name).collect();
+    let selected = |args: &[&str]| {
+        let args = Args::parse(args.iter().map(|a| a.to_string()))?;
+        Ok::<_, String>(
+            all.iter()
+                .copied()
+                .filter(|name| args.selects(name))
+                .collect::<Vec<_>>(),
+        )
+    };
+
+    assert_eq!(selected(&[]), Ok(all.clone()));
+    // nextest lists the cases, then the ignored ones, then runs each by name.
+    assert_eq!(selected(&["--list", "--format", "terse"]), Ok(all.clone()));
+    assert_eq!(
+        selected(&["--list", "--format", "terse", "--ignored"]),
+        Ok(vec![])
+    );
+    assert_eq!(
+        selected(&["--exact", "cross_host_hit", "--nocapture"]),
+        Ok(vec!["cross_host_hit"])
+    );
+    assert_eq!(selected(&["--exact", "cross_host"]), Ok(vec![]));
+    // An option's value is never a filter.
+    assert_eq!(
+        selected(&["--test-threads", "1", "--skip", "cross_host"]),
+        Ok(all[1..].to_vec())
+    );
+    assert_eq!(
+        selected(&["--skip=exit_125"]),
+        Ok(all
+            .iter()
+            .copied()
+            .filter(|name| !name.ends_with("exit_125"))
+            .collect())
+    );
+    assert!(selected(&["--skip"]).is_err());
+    assert!(selected(&["--bogus"]).is_err());
 }
