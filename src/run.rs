@@ -188,7 +188,8 @@ impl Call<'_> {
     /// Run the command and record the outcome: the value on success, the
     /// bumped marker on failure. `marker` is the current one, if any.
     fn record(&self, supervisor: &Supervisor, stale: Option<Stale>, marker: Option<Marker>) -> i32 {
-        let (code, stdout) = match supervisor.run(&self.args.command, true) {
+        let (code, stdout) = match supervisor.run(&self.args.command, Some(self.store.max_output()))
+        {
             Ran::SpawnFailed { code } => {
                 // The command never started, so the origin was not reached:
                 // no marker is set or bumped. `Supervisor::run` has already
@@ -219,17 +220,7 @@ impl Call<'_> {
                 Stdout::Captured(out) => {
                     // Print before the write-back, so a pipeline sees output at once.
                     emit(out);
-                    match self.store.max_output() {
-                        Some(max) if out.len() > max => {
-                            warn(&format!(
-                                "the output is {}, over the {} that --backend saas stores, so it was not cached",
-                                size(out.len()),
-                                size(max)
-                            ));
-                            None
-                        }
-                        _ => Some(Envelope::encode(now, out)),
-                    }
+                    Some(Envelope::encode(now, out))
                 }
                 _ => None,
             };
@@ -336,7 +327,7 @@ impl Call<'_> {
 }
 
 fn run_uncached(supervisor: &Supervisor, argv: &[std::ffi::OsString]) -> i32 {
-    match supervisor.run(argv, false) {
+    match supervisor.run(argv, None) {
         Ran::SpawnFailed { code } | Ran::Exited { code, .. } => code,
         Ran::StatusUnknown { .. } => 126,
         Ran::Interrupted { signal } => 128 + signal,
@@ -415,15 +406,5 @@ fn fill_lock(path: &Path, wait: bool) -> std::io::Result<Option<OwnedFd>> {
             Err(rustix::io::Errno::INTR) => {}
             Err(e) => return Err(e.into()),
         }
-    }
-}
-
-/// `1 MiB`-style rendering for stderr lines.
-fn size(bytes: usize) -> String {
-    const MIB: usize = 1024 * 1024;
-    if bytes >= MIB {
-        format!("{:.1} MiB", bytes as f64 / MIB as f64).replace(".0 ", " ")
-    } else {
-        format!("{} KiB", bytes.div_ceil(1024))
     }
 }

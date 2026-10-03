@@ -62,10 +62,10 @@ Concurrent calls for the same command on one machine run it once: the first
 takes a lock and the rest wait for its result, or serve stale output if they
 have it. Output larger than 20 MiB is passed through and not cached; with
 `--backend saas` the limit is 1 MiB, so that every host can read an entry back
-within its 1-second request deadline. Output over the limit is printed in full,
-with one warning. With
-`--backend saas` the backoff is shared by every host, but the lock is not, so
-hosts that miss at the same moment each run the command.
+within its 1-second request deadline. Either way ck prints one warning when
+output passes the limit. With `--backend saas` the backoff is shared by every
+host, but the lock is not, so hosts that miss at the same moment each run the
+command.
 
 ### stdin must be `/dev/null`
 

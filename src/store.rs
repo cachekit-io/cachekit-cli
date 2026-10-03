@@ -17,10 +17,10 @@ use crate::{warn, Fatal};
 /// timeouts (30 s per request, 10 s to connect) cannot be changed.
 pub(crate) const SAAS_DEADLINE: Duration = Duration::from_secs(1);
 
-/// The largest output ck stores on saas. The deadline covers the download
-/// too, so an entry one host can write must be one every host can read
-/// within it: past this size, a slow link would see a healthy backend time
-/// out on every call, and never recover while faster hosts keep it fresh.
+/// The saas capture cap. The deadline covers the download too, so an entry
+/// one host can write must be one every host can read within it: past this
+/// size, a slow link would see a healthy backend time out on every call, and
+/// never recover while faster hosts keep it fresh.
 pub(crate) const SAAS_MAX_OUTPUT: usize = 1024 * 1024;
 
 /// Why a read produced no answer.
@@ -114,9 +114,11 @@ impl Store {
         )
     }
 
-    /// The largest output this backend stores, if it has a limit.
-    pub fn max_output(&self) -> Option<usize> {
-        self.deadline.map(|_| SAAS_MAX_OUTPUT)
+    /// The most output this backend stores. Capture stops there and streams
+    /// the rest, so output that cannot be stored is never held back.
+    pub fn max_output(&self) -> usize {
+        self.deadline
+            .map_or(crate::child::OUTPUT_CAP, |_| SAAS_MAX_OUTPUT)
     }
 
     pub fn set(&self, key: &str, plaintext: &[u8], ttl: Duration) -> Result<(), String> {

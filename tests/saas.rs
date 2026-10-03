@@ -64,8 +64,8 @@ const CASES: &[(&str, fn())] = &[
         a_failed_write_after_the_run_warns_once,
     ),
     (
-        "output_over_1_mib_is_not_stored",
-        output_over_1_mib_is_not_stored,
+        "output_over_1_mib_is_streamed_and_not_stored",
+        output_over_1_mib_is_streamed_and_not_stored,
     ),
     (
         "a_fresh_value_wins_over_a_failed_marker_read",
@@ -581,17 +581,45 @@ fn readme_saas_examples_run() {
     }
 }
 
-fn output_over_1_mib_is_not_stored() {
+fn output_over_1_mib_is_streamed_and_not_stored() {
+    use std::io::Read;
+    use std::os::unix::fs::PermissionsExt;
+
     let service = Service::new();
     let host = Sandbox::new();
-    let big = "x".repeat(1024 * 1024) + "\n";
-    host.set("out", &big);
-    let out = service.run(&host, &["--ttl", "1h"]);
+    // Just over 1 MiB, then a pause: the output must reach the caller while
+    // the command is still running, not when it exits.
+    let size = 1024 * 1024 + 4096;
+    let origin = host.bin().join("origin");
+    fs::write(
+        &origin,
+        format!("#!/bin/sh\nhead -c {size} /dev/zero | tr '\\0' x\nsleep 3\n"),
+    )
+    .unwrap();
+    fs::set_permissions(&origin, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let started = Instant::now();
+    let mut child = service.ck(&host, &["--ttl", "1h"]).spawn().unwrap();
+    let mut pipe = child.stdout.take().unwrap();
+    let mut got = vec![0u8; size];
+    pipe.read_exact(&mut got).unwrap();
+    let streamed_after = started.elapsed();
+    let mut rest = Vec::new();
+    pipe.read_to_end(&mut rest).unwrap();
+    let out = child.wait_with_output().unwrap();
+
+    assert!(
+        streamed_after < Duration::from_secs(2),
+        "the output was held until the command exited ({streamed_after:?})"
+    );
+    assert!(
+        rest.is_empty() && got.iter().all(|&b| b == b'x'),
+        "the output changed"
+    );
     assert_eq!(code(&out), 0);
-    assert_eq!(out.stdout.len(), big.len(), "the output was cut");
     let warnings = lines(&out);
     assert_eq!(warnings.len(), 1, "{warnings:?}");
-    assert!(warnings[0].contains("over the 1 MiB"), "{warnings:?}");
+    assert!(warnings[0].contains("passed 1 MiB"), "{warnings:?}");
     assert!(
         !service.calls().iter().any(|c| c == "set value"),
         "{:?}",
@@ -599,10 +627,6 @@ fn output_over_1_mib_is_not_stored() {
     );
     // The success still ends any backoff.
     assert!(service.calls().iter().any(|c| c == "delete marker"));
-
-    // The same output fits the file backend, which keeps its 20 MiB cap.
-    let out = host.run(&["--ttl", "1h"]);
-    assert_eq!((code(&out), stderr(&out)), (0, String::new()));
 }
 
 fn a_fresh_value_wins_over_a_failed_marker_read() {
