@@ -14,6 +14,12 @@ resolver = "3"
 name = "ck"
 path = "src/main.rs"
 
+# Runs ck's saas path against a fake backend. Without libtest's harness, the
+# test binary can also act as ck itself (see the file's header).
+[[test]]
+name = "saas"
+harness = false
+
 [lints.rust]
 # deny, not forbid: three audited blocks in src/child.rs read a signal's
 # inherited disposition, restore an ignored SIGCHLD in the child, and block
@@ -23,14 +29,15 @@ unsafe_code = "deny"
 [dependencies]
 blake2 = "0.10"
 cachekit-core = { version = "0.6", default-features = false, features = ["encryption"] }
-cachekit-rs = { version = "0.9", default-features = false, features = ["encryption", "file"] }
+cachekit-rs = { version = "0.9", default-features = false, features = ["cachekitio", "encryption", "file"] }
 getrandom = "0.2"
 hex = "0.4"
 libc = "0.2"
 rustix = { version = "1", default-features = false, features = ["std", "fs", "process"] }
 signal-hook = "0.4"
-tokio = { version = "1", default-features = false, features = ["rt"] }
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "time"] }
 
 [dev-dependencies]
+async-trait = "0.1"
 rustix = { version = "1", features = ["pty"] }
 tempfile = "3"

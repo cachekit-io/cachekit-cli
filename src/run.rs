@@ -15,13 +15,20 @@ use std::time::Duration;
 use rustix::fs::{FlockOperation, Mode, OFlags};
 
 use crate::child::{Ran, Stdout, Supervisor};
-use crate::cli::RunArgs;
+use crate::cli::{BackendKind, RunArgs};
 use crate::entry::{human, now_ms, Envelope, Freshness, Marker};
 use crate::keys::{self, KeyHasher};
+use crate::saas::{self, Connect};
 use crate::store::{ReadError, Store};
 use crate::{emit, warn, Fatal};
 
-pub fn run(args: &RunArgs) -> Result<i32, Fatal> {
+pub fn run(args: &RunArgs, connect: &Connect) -> Result<i32, Fatal> {
+    // saas credentials are checked first, so a saas call without them exits
+    // 125 whatever its stdin, before anything runs.
+    let credentials = match args.backend {
+        BackendKind::File => None,
+        BackendKind::Saas => Some(saas::credentials()?),
+    };
     if let Some(kind) = uncacheable_stdin() {
         warn(&format!(
             "stdin is {kind}, so this call is not cached. End the command with `< /dev/null` to cache it"
@@ -33,11 +40,23 @@ pub fn run(args: &RunArgs) -> Result<i32, Fatal> {
         .filter(|h| !h.is_empty())
         .map(PathBuf::from)
         .ok_or_else(|| Fatal("HOME is not set".into()))?;
-    let master_key = keys::master_key(&home.join(".config/ck"))?;
     let cache_dir = home.join(".cache/ck");
-    let store = Store::open_file(&cache_dir.join("data"), &master_key)?;
+    let (store, master_key) = match credentials {
+        None => {
+            let master_key = keys::master_key(&home.join(".config/ck"))?;
+            (
+                Store::open_file(&cache_dir.join("data"), &master_key)?,
+                master_key,
+            )
+        }
+        Some(c) => (
+            Store::open_saas(connect(&c.api_key)?, &c.master_key)?,
+            c.master_key,
+        ),
+    };
     let key = KeyHasher::new(&master_key)?.value_key(&args.scope, &args.command);
 
+    // The fill lock is host-local on every backend.
     let call = Call {
         args,
         marker_key: keys::marker_key(&key),
@@ -91,11 +110,18 @@ impl Call<'_> {
                 let stale = stale.unwrap_or_else(|| {
                     unreachable!("only a call with stale output skips the wait")
                 });
-                let marker = self.store.marker(&self.marker_key).ok().flatten();
+                // The marker only adds to the stderr line, so a failed read
+                // still serves stale: the lock holder is running the command.
+                // The cause joins that one line.
+                let (marker, unavailable) = match self.store.marker(&self.marker_key) {
+                    Ok(m) => (m, None),
+                    Err(ReadError::Local(fatal)) => return Err(fatal),
+                    Err(ReadError::Backend(e)) => (None, Some(e)),
+                };
                 if let Some(code) = supervisor.interrupted() {
                     return Ok(code);
                 }
-                return Ok(self.serve_stale(&stale, marker.as_ref(), None));
+                return Ok(self.serve_stale(&stale, marker.as_ref(), None, unavailable));
             }
             Err(e) => {
                 warn(&format!(
@@ -107,12 +133,11 @@ impl Call<'_> {
         };
 
         // Holding the lock: whoever held it before may have filled the value.
-        let (value, marker) = match (
-            self.store.value(&self.key),
-            self.store.marker(&self.marker_key),
-        ) {
-            (Ok(v), Ok(m)) => (v, m),
-            (Err(e), _) | (_, Err(e)) => return self.read_failed(e, &supervisor),
+        // A fresh value wins even if the marker read failed.
+        let (value, marker) = self.store.value_and_marker(&self.key, &self.marker_key);
+        let value = match value {
+            Ok(v) => v,
+            Err(e) => return self.read_failed(e, &supervisor),
         };
         let stale = match self.fresh_or_stale(value) {
             ControlFlow::Break(fresh) => {
@@ -124,13 +149,17 @@ impl Call<'_> {
             }
             ControlFlow::Continue(stale) => stale,
         };
+        let marker = match marker {
+            Ok(m) => m,
+            Err(e) => return self.read_failed(e, &supervisor),
+        };
         let now = now_ms();
         if let Some(m) = marker.filter(|m| m.is_active(now)) {
             if let Some(code) = supervisor.interrupted() {
                 return Ok(code);
             }
             if let Some(stale) = stale {
-                return Ok(self.serve_stale(&stale, Some(&m), None));
+                return Ok(self.serve_stale(&stale, Some(&m), None, None));
             }
             warn(&format!(
                 "not running the command: its last run exited {}; next retry in {}. Use --refresh to run it now",
@@ -149,27 +178,33 @@ impl Call<'_> {
     /// Never serves stale. The marker is read only to continue its count.
     fn refresh(&self) -> Result<i32, Fatal> {
         let supervisor = Supervisor::install()?;
-        let marker = self.store.marker(&self.marker_key).ok().flatten();
+        let marker = match self.store.marker(&self.marker_key) {
+            Ok(m) => m,
+            Err(e) => return self.read_failed(e, &supervisor),
+        };
         Ok(self.record(&supervisor, None, marker))
     }
 
     /// Run the command and record the outcome: the value on success, the
     /// bumped marker on failure. `marker` is the current one, if any.
     fn record(&self, supervisor: &Supervisor, stale: Option<Stale>, marker: Option<Marker>) -> i32 {
-        let (code, stdout) = match supervisor.run(&self.args.command, true) {
+        let (code, stdout) = match supervisor.run(&self.args.command, Some(self.store.max_output()))
+        {
             Ran::SpawnFailed { code } => {
                 // The command never started, so the origin was not reached:
                 // no marker is set or bumped. `Supervisor::run` has already
                 // turned a received signal into `Interrupted`.
                 return match stale {
-                    Some(stale) => self.serve_stale(&stale, None, None),
+                    Some(stale) => self.serve_stale(&stale, None, None, None),
                     None => code,
                 };
             }
             Ran::Interrupted { signal } => return 128 + signal,
             Ran::StatusUnknown { stdout } => {
                 return match (stale, stdout) {
-                    (Some(stale), Stdout::Captured(_)) => self.serve_stale(&stale, None, None),
+                    (Some(stale), Stdout::Captured(_)) => {
+                        self.serve_stale(&stale, None, None, None)
+                    }
                     (_, stdout) => {
                         stdout.emit_captured();
                         126
@@ -181,19 +216,32 @@ impl Call<'_> {
 
         let now = now_ms();
         if code == 0 {
-            if let Stdout::Captured(out) = &stdout {
-                // Print before the write-back, so a pipeline sees output at once.
-                emit(out);
-                let ttl = Duration::from_secs(self.args.ttl_secs + self.args.stale_secs);
-                if let Err(e) = self.store.set(&self.key, &Envelope::encode(now, out), ttl) {
-                    warn(&format!(
-                        "the command succeeded but its output was not cached: {e}"
-                    ));
+            let envelope = match &stdout {
+                Stdout::Captured(out) => {
+                    // Print before the write-back, so a pipeline sees output at once.
+                    emit(out);
+                    Some(Envelope::encode(now, out))
                 }
-            }
-            // A success ends the backoff, whether or not its output was stored.
-            if let Err(e) = self.store.delete(&self.marker_key) {
-                warn(&format!("cannot clear the recorded failure: {e}"));
+                _ => None,
+            };
+            let ttl = Duration::from_secs(self.args.ttl_secs + self.args.stale_secs);
+            // A success ends the backoff, whether or not its output is stored.
+            let (stored, cleared) = self.store.record_success(
+                &self.key,
+                envelope.as_deref().map(|e| (e, ttl)),
+                &self.marker_key,
+            );
+            // One warning: a failed write and a failed clear usually share a cause.
+            match (stored, cleared) {
+                (Err(e), Err(_)) => warn(&format!(
+                    "the command succeeded but its output was not cached: {e}; \
+                     any recorded failure still stands, so the next call may not run it"
+                )),
+                (Err(e), Ok(())) => warn(&format!(
+                    "the command succeeded but its output was not cached: {e}"
+                )),
+                (Ok(()), Err(e)) => warn(&format!("cannot clear the recorded failure: {e}")),
+                (Ok(()), Ok(())) => {}
             }
             return 0;
         }
@@ -211,7 +259,9 @@ impl Call<'_> {
             warn(&format!("cannot record the failure: {e}"));
         }
         match (stdout, stale) {
-            (Stdout::Captured(_), Some(stale)) => self.serve_stale(&stale, Some(&next), Some(code)),
+            (Stdout::Captured(_), Some(stale)) => {
+                self.serve_stale(&stale, Some(&next), Some(code), None)
+            }
             (stdout, _) => {
                 stdout.emit_captured();
                 code
@@ -232,8 +282,15 @@ impl Call<'_> {
         }
     }
 
-    /// Replay a stored exit-0 run with exit 0 and one stderr line.
-    fn serve_stale(&self, stale: &Stale, marker: Option<&Marker>, failed_now: Option<i32>) -> i32 {
+    /// Replay a stored exit-0 run with exit 0 and one stderr line, which ends
+    /// with `unavailable`, the backend error, when there was one.
+    fn serve_stale(
+        &self,
+        stale: &Stale,
+        marker: Option<&Marker>,
+        failed_now: Option<i32>,
+        unavailable: Option<String>,
+    ) -> i32 {
         let now = now_ms();
         let mut line = match failed_now {
             Some(code) => format!(
@@ -247,6 +304,9 @@ impl Call<'_> {
                 line.push_str(&format!("; the last run exited {}", m.exit));
             }
             line.push_str(&format!("; next retry in {}", human(m.retry_at_ms - now)));
+        }
+        if let Some(e) = unavailable {
+            line.push_str(&format!("; the cache is unavailable ({e})"));
         }
         warn(&line);
         emit(&stale.envelope.stdout);
@@ -267,7 +327,7 @@ impl Call<'_> {
 }
 
 fn run_uncached(supervisor: &Supervisor, argv: &[std::ffi::OsString]) -> i32 {
-    match supervisor.run(argv, false) {
+    match supervisor.run(argv, None) {
         Ran::SpawnFailed { code } | Ran::Exited { code, .. } => code,
         Ran::StatusUnknown { .. } => 126,
         Ran::Interrupted { signal } => 128 + signal,

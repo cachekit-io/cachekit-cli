@@ -18,8 +18,9 @@ use crate::{emit, warn, Fatal};
 /// The signals ck takes over while it may block or run the command.
 const HANDLED: [i32; 4] = [SIGTERM, SIGHUP, SIGINT, SIGQUIT];
 
-/// Output past this is streamed, not cached. The SaaS rejects values over
-/// 25 MB; the margin covers the envelope and encryption overhead.
+/// The file backend's capture cap: output past this is streamed, not cached.
+/// It is under the SaaS's 25 MB value limit, with a margin for the envelope
+/// and encryption overhead, so the file and saas limits stay comparable.
 pub const OUTPUT_CAP: usize = 20 * 1024 * 1024;
 
 pub enum Ran {
@@ -233,8 +234,8 @@ impl Supervisor {
 
     /// Run `argv` with every `CACHEKIT_*` variable removed from its
     /// environment. stdin and stderr pass straight through. stdout is
-    /// captured up to [`OUTPUT_CAP`] when `capture` is set, else inherited.
-    pub fn run(&self, argv: &[OsString], capture: bool) -> Ran {
+    /// captured up to `capture` bytes when it is set, else inherited.
+    pub fn run(&self, argv: &[OsString], capture: Option<usize>) -> Ran {
         let mut command = Command::new(&argv[0]);
         command.args(&argv[1..]);
         // Hygiene against accidents, not a boundary: a build log or `env`
@@ -244,7 +245,7 @@ impl Supervisor {
                 command.env_remove(name);
             }
         }
-        if capture {
+        if capture.is_some() {
             command.stdout(Stdio::piped());
         }
         if self.sigchld_ignored {
@@ -296,9 +297,9 @@ impl Supervisor {
             }
         };
 
-        let stdout = match child.stdout.take() {
-            Some(pipe) => collect(pipe),
-            None => Stdout::Written,
+        let stdout = match (child.stdout.take(), capture) {
+            (Some(pipe), Some(cap)) => collect(pipe, cap),
+            _ => Stdout::Written,
         };
 
         // Wait without reaping, then mark the child exited, then reap. A
@@ -335,10 +336,10 @@ impl Supervisor {
     }
 }
 
-/// Read the child's stdout into memory, or, once it passes the cap, write
+/// Read the child's stdout into memory, or, once it passes `cap` bytes, write
 /// out what is held and stream the rest. Once ck's own stdout fails, the pipe
 /// is dropped, so the command gets SIGPIPE just as it would without ck.
-fn collect(mut pipe: impl Read) -> Stdout {
+fn collect(mut pipe: impl Read, cap: usize) -> Stdout {
     let mut buffer = Vec::new();
     let mut chunk = vec![0u8; 64 * 1024];
     loop {
@@ -352,8 +353,11 @@ fn collect(mut pipe: impl Read) -> Stdout {
                 return Stdout::Written;
             }
         };
-        if buffer.len() + n > OUTPUT_CAP {
-            warn("the command's output passed 20 MiB, so this run is not cached");
+        if buffer.len() + n > cap {
+            warn(&format!(
+                "the command's output passed {} MiB, so this run is not cached",
+                cap / (1024 * 1024)
+            ));
             if emit(&buffer) && emit(&chunk[..n]) && stream(pipe, &mut chunk) {
                 return Stdout::Written;
             }

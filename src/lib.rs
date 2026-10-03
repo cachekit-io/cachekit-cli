@@ -11,6 +11,7 @@ pub mod cli;
 pub mod entry;
 pub mod keys;
 mod run;
+pub mod saas;
 pub mod store;
 
 /// ck's own error before the command runs: printed, then exit 125.
@@ -21,6 +22,14 @@ pub struct Fatal(pub String);
 pub const EXIT_CK_ERROR: i32 = 125;
 
 pub fn main(args: impl IntoIterator<Item = OsString>) -> i32 {
+    main_with(args, &saas::connect)
+}
+
+/// [`main`] with the SaaS client replaced, so tests can run ck's saas path
+/// against a fake backend. A local HTTP stub cannot stand in for the service:
+/// the cachekit-rs client refuses loopback and private addresses.
+#[doc(hidden)]
+pub fn main_with(args: impl IntoIterator<Item = OsString>, connect: &saas::Connect) -> i32 {
     let invocation = match cli::parse(args) {
         Ok(i) => i,
         Err(e) => {
@@ -38,7 +47,7 @@ pub fn main(args: impl IntoIterator<Item = OsString>) -> i32 {
             emit(format!("ck {}\n", env!("CARGO_PKG_VERSION")).as_bytes());
             0
         }
-        cli::Invocation::Run(args) => run::run(&args).unwrap_or_else(|Fatal(e)| {
+        cli::Invocation::Run(args) => run::run(&args, connect).unwrap_or_else(|Fatal(e)| {
             warn(&e);
             EXIT_CK_ERROR
         }),

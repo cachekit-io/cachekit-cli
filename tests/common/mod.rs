@@ -82,8 +82,13 @@ impl Sandbox {
     /// /dev/null and no CacheKit variables inherited from the machine running
     /// the tests.
     pub fn ck(&self, args: &[&str]) -> Command {
+        self.command(Path::new(BIN), args)
+    }
+
+    /// As [`Sandbox::ck`], with another program standing in for `ck`.
+    pub fn command(&self, program: &Path, args: &[&str]) -> Command {
         use std::os::unix::process::CommandExt;
-        let mut cmd = Command::new(BIN);
+        let mut cmd = Command::new(program);
         // Its own process group, so a failing test can kill ck together with
         // its command and any background job (see `wait_exit`).
         cmd.process_group(0);
@@ -151,4 +156,30 @@ pub fn entries(dir: &Path) -> Vec<String> {
         .unwrap_or_default();
     names.sort();
     names
+}
+
+/// The bodies of the README's `sh` code blocks.
+pub fn readme_sh_blocks() -> Vec<String> {
+    let readme = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md")).unwrap();
+    sh_blocks(&readme)
+}
+
+fn sh_blocks(markdown: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut current: Option<String> = None;
+    for line in markdown.lines() {
+        match (&mut current, line.trim_end()) {
+            (None, "```sh") => current = Some(String::new()),
+            (Some(block), "```") => {
+                blocks.push(std::mem::take(block));
+                current = None;
+            }
+            (Some(block), text) => {
+                block.push_str(text);
+                block.push('\n');
+            }
+            (None, _) => {}
+        }
+    }
+    blocks
 }
