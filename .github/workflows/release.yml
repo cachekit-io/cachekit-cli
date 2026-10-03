@@ -6,12 +6,21 @@ name: Release
 # crate to crates.io. The release runs in this workflow, not on the tag, so
 # it never depends on a tag push starting a run, and a pushed tag releases
 # nothing.
+# If a release fails after release-please created it, rerun the failed jobs,
+# or dispatch this workflow on main with the release tag: either rebuilds,
+# re-attests and re-uploads that release and retries the crates.io publish.
 # Users verify a binary against this file's path and refs/heads/main, so
-# renaming the file or changing the trigger breaks the README's verify command.
+# renaming the file or running it from another ref fails the README's check.
 
 on:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to rebuild and publish, e.g. v0.1.0
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -55,16 +64,38 @@ jobs:
 
   check:
     needs: release-please
-    if: needs.release-please.outputs.release_created == 'true'
+    if: >-
+      needs.release-please.outputs.release_created == 'true'
+      || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
     env:
-      TAG: ${{ needs.release-please.outputs.tag_name }}
+      # A dispatch names the tag; a push releases what release-please created.
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || needs.release-please.outputs.tag_name }}
     steps:
+      - name: Tag is a release version
+        id: tag
+        run: |
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::$TAG is not a release tag such as v0.1.0"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.release-please.outputs.tag_name }}
+          ref: ${{ steps.tag.outputs.tag }}
+          fetch-depth: 0
           persist-credentials: false
+
+      - name: Tagged commit is on main
+        # A dispatch can name any tag; only one on main may be built and
+        # attested as a run from main.
+        run: |
+          git merge-base --is-ancestor HEAD origin/main \
+            || { echo "::error::$TAG is not on main"; exit 1; }
 
       - name: Tag matches the crate version
         run: |
@@ -80,7 +111,7 @@ jobs:
 
   build:
     name: build (${{ matrix.target }})
-    needs: [release-please, check]
+    needs: check
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -91,12 +122,12 @@ jobs:
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
           - { os: macos-latest, target: aarch64-apple-darwin }
     env:
-      TAG: ${{ needs.release-please.outputs.tag_name }}
+      TAG: ${{ needs.check.outputs.tag }}
       TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.release-please.outputs.tag_name }}
+          ref: ${{ needs.check.outputs.tag }}
           persist-credentials: false
 
       - name: Install the musl toolchain
@@ -127,7 +158,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [release-please, build]
+    needs: [check, build]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # Signing happens here rather than in the build jobs, so dependency build
@@ -159,11 +190,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ needs.release-please.outputs.tag_name }}
+          TAG: ${{ needs.check.outputs.tag }}
         run: gh release upload "$TAG" --clobber dist/*.tar.gz
 
   publish:
-    needs: [release-please, release]
+    needs: [check, release]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # crates.io accepts a token minted here only from this workflow in this
@@ -175,7 +206,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.release-please.outputs.tag_name }}
+          ref: ${{ needs.check.outputs.tag }}
           persist-credentials: false
 
       # Needs the crate to exist on crates.io with this workflow and the
