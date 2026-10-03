@@ -122,6 +122,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
+          # A rerun, after a failed upload or publish, finds the release
+          # already there: replace its archives with this run's attested ones
+          # so the publish job still runs.
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" --clobber dist/*.tar.gz
+            exit
+          fi
           prerelease=()
           case "$GITHUB_REF_NAME" in *-*) prerelease=(--prerelease) ;; esac
           gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes "${prerelease[@]}" \
