@@ -1,13 +1,16 @@
 name: Release
 
-# A version tag (v0.1.0, v0.2.0-rc.1) on a commit in main publishes that
-# version: attested binaries on the GitHub Release, then the crate on
-# crates.io. Users verify a binary against this file's path, so renaming it
-# breaks the verify command in the README.
+# Every push to main runs release-please, which keeps a release PR open with
+# the next version and changelog. Merging that PR creates the tag and GitHub
+# Release, and the jobs below then attach attested binaries and publish the
+# crate to crates.io. A pushed tag releases nothing: tags the App creates do
+# not trigger workflows, so the whole release runs in this one workflow.
+# Users verify a binary against this file's path and refs/heads/main, so
+# renaming the file or changing the trigger breaks the README's verify command.
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
 
 permissions:
   contents: read
@@ -17,28 +20,58 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  check:
+  release-please:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      # The App token, not GITHUB_TOKEN, opens the release PR, so CI runs on it.
+      - uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
+        id: app-token
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          # Only what release-please and the assignee step use.
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+
+      - uses: googleapis/release-please-action@16a9c90856f42705d54a6fda1823352bdc62cf38 # v4
+        id: release
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Assign the release PR to the maintainer
+        if: ${{ steps.release.outputs.pr }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          # Via env: the PR JSON carries branch and title text.
+          PR_JSON: ${{ steps.release.outputs.pr }}
+        run: gh pr edit "$(jq -er .number <<< "$PR_JSON")" --add-assignee 27Bslash6
+
+  check:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TAG: ${{ needs.release-please.outputs.tag_name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
+          ref: ${{ needs.release-please.outputs.tag_name }}
           persist-credentials: false
 
       - name: Tag matches the crate version
         run: |
           version=$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[0].version')
-          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match the crate version $version"
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::tag $TAG does not match the crate version $version"
             exit 1
           fi
-
-      - name: Tagged commit is on main
-        # Catches a version tag pushed on the wrong commit by mistake.
-        run: |
-          git merge-base --is-ancestor "$GITHUB_SHA" origin/main \
-            || { echo "::error::$GITHUB_SHA is not on main"; exit 1; }
 
       - name: Package the crate
         # Builds the packaged crate, so the publish job can skip that build.
@@ -46,7 +79,7 @@ jobs:
 
   build:
     name: build (${{ matrix.target }})
-    needs: check
+    needs: [release-please, check]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -57,10 +90,12 @@ jobs:
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
           - { os: macos-latest, target: aarch64-apple-darwin }
     env:
+      TAG: ${{ needs.release-please.outputs.tag_name }}
       TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
           persist-credentials: false
 
       - name: Install the musl toolchain
@@ -79,7 +114,7 @@ jobs:
 
       - name: Archive
         run: |
-          dir="ck-$GITHUB_REF_NAME-$TARGET"
+          dir="ck-$TAG-$TARGET"
           mkdir "$dir"
           cp "target/$TARGET/release/ck" LICENSE README.md "$dir/"
           tar -czf "$dir.tar.gz" "$dir"
@@ -91,13 +126,13 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: build
+    needs: [release-please, build]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # Signing happens here rather than in the build jobs, so dependency build
     # scripts never run with a token that can sign or publish.
     permissions:
-      contents: write # create the release
+      contents: write # upload to the release
       id-token: write # sign the attestation
       attestations: write # store the attestation
     steps:
@@ -117,28 +152,17 @@ jobs:
             dist/*.tar.gz
             dist/ck-*/ck
 
-      - name: Create the GitHub Release
+      - name: Upload to the GitHub Release
+        # release-please created the release. --clobber lets a rerun replace
+        # the archives with its own attested ones.
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: |
-          # A rerun, after a failed upload or publish, finds the release
-          # already there: replace its archives with this run's attested ones
-          # so the publish job still runs. gh creates a release with assets as
-          # a draft and publishes it after the uploads, so a run that died
-          # mid-upload can leave a draft behind; publish it here.
-          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" --clobber dist/*.tar.gz
-            gh release edit "$GITHUB_REF_NAME" --draft=false
-            exit
-          fi
-          prerelease=()
-          case "$GITHUB_REF_NAME" in *-*) prerelease=(--prerelease) ;; esac
-          gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes "${prerelease[@]}" \
-            dist/*.tar.gz
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: gh release upload "$TAG" --clobber dist/*.tar.gz
 
   publish:
-    needs: release
+    needs: [release-please, release]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # crates.io accepts a token minted here only from this workflow in this
@@ -150,12 +174,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
           persist-credentials: false
 
       # Needs the crate to exist on crates.io with this workflow and the
       # `release` environment registered as its trusted publisher. crates.io
       # attaches a publisher only to an existing crate, so 0.0.0 is published
-      # by hand with an API token first. Every tagged version comes after it,
+      # by hand with an API token first. Every released version comes after it,
       # because this job cannot publish a version that already exists.
       - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
         id: auth

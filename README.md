@@ -27,11 +27,12 @@ you unpack it:
 ```text
 gh attestation verify ck-v0.1.0-x86_64-unknown-linux-musl.tar.gz --repo cachekit-io/cachekit-cli \
   --signer-workflow cachekit-io/cachekit-cli/.github/workflows/release.yml \
-  --deny-self-hosted-runners
+  --source-ref refs/heads/main --deny-self-hosted-runners
 ```
 
 The check passes only if the file was built by this repository's release
-workflow on a GitHub-hosted runner. `--owner cachekit-io` alone is not enough:
+workflow, run from `main`, on a GitHub-hosted runner. `--owner cachekit-io`
+alone is not enough:
 it accepts a file built by any workflow in any `cachekit-io` repository. The
 `ck` binary inside the archive is attested too, so the same command verifies it
 after unpacking.
