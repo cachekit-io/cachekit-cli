@@ -266,7 +266,11 @@ fn the_command_gets_an_empty_stdin_whatever_cks_is() {
                 .spawn()
                 .unwrap();
             if let Some(mut pipe) = child.stdin.take() {
-                pipe.write_all(b"from a pipe\n").unwrap();
+                // ck may exit before the write lands, as nothing reads the
+                // pipe. Then the write fails with EPIPE, which is no failure.
+                if let Err(e) = pipe.write_all(b"from a pipe\n") {
+                    assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe, "{e}");
+                }
             }
             // A command handed ck's terminal or socket would wait on it forever.
             let msg = format!("{kind}: the command waited on ck's stdin");
