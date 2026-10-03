@@ -450,6 +450,13 @@ fn a_corrupt_entry_is_a_miss_and_never_served() {
         "{}",
         stderr(&out)
     );
+    // The tampered entry is reported once, on stderr.
+    assert_eq!(
+        stderr(&out).matches("failed to decrypt").count(),
+        1,
+        "{}",
+        stderr(&out)
+    );
     // A miss refills the entry; a backend error would have run uncached.
     assert_eq!(stdout(&s.run(&["--ttl", "1h", "--stale", "1h"])), "rerun\n");
     assert_eq!(s.runs(), 2);

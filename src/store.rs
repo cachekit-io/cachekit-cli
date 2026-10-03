@@ -1,5 +1,6 @@
 //! Encrypted reads and writes against a cachekit-rs `Backend`.
 
+use std::cell::Cell;
 use std::path::Path;
 use std::time::Duration;
 
@@ -9,7 +10,7 @@ use cachekit::{BackendErrorKind, CachekitError, EncryptionLayer};
 
 use crate::entry::{Envelope, Marker};
 use crate::keys::TENANT;
-use crate::Fatal;
+use crate::{warn, Fatal};
 
 /// Why a read produced no answer.
 pub enum ReadError {
@@ -23,6 +24,7 @@ pub struct Store {
     runtime: tokio::runtime::Runtime,
     backend: Box<dyn Backend>,
     layer: EncryptionLayer,
+    decrypt_warned: Cell<bool>,
 }
 
 impl Store {
@@ -49,6 +51,7 @@ impl Store {
             runtime,
             backend,
             layer,
+            decrypt_warned: Cell::new(false),
         })
     }
 
@@ -93,8 +96,20 @@ impl Store {
                 "encryption is misconfigured: {e}"
             )))),
             // A decrypt or AAD failure is a miss: it is never served, not even
-            // as stale, and a marker that fails to decrypt is absent.
-            Err(_) => Ok(None),
+            // as stale, and a marker that fails to decrypt is absent. A new
+            // master key changes the keyed file name too, so a rotation never
+            // lands here: this means a corrupted or tampered entry, which is
+            // worth one line. The error names no key material.
+            Err(e) => {
+                // A call reads an entry twice (before and under the fill
+                // lock), so report it once.
+                if !self.decrypt_warned.replace(true) {
+                    warn(&format!(
+                        "a stored entry failed to decrypt ({e}); treating it as a miss"
+                    ));
+                }
+                Ok(None)
+            }
         }
     }
 }

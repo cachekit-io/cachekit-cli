@@ -117,7 +117,9 @@ so neither the output nor the command line appears on disk. The key comes from
 it is set. Otherwise ck
 creates a random key in `~/.config/ck/file.key` on first use, mode 0600. If
 that file is damaged, ck exits 125 and tells you to delete it; it never
-overwrites it.
+overwrites it. A stored entry that fails to decrypt, because it was corrupted
+or tampered with, is never served: ck treats it as a miss and prints one
+warning.
 
 ck removes every `CACHEKIT_*` variable from the command's environment, so a
 log or environment dump from the command does not carry your keys.
