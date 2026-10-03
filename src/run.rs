@@ -5,10 +5,9 @@
 //! is inert while the value is fresh.
 
 use std::fs;
-use std::io::IsTerminal;
 use std::ops::ControlFlow;
-use std::os::fd::{AsFd, OwnedFd};
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
+use std::os::fd::OwnedFd;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -23,18 +22,11 @@ use crate::store::{ReadError, Store};
 use crate::{emit, warn, Fatal};
 
 pub fn run(args: &RunArgs, connect: &Connect) -> Result<i32, Fatal> {
-    // saas credentials are checked first, so a saas call without them exits
-    // 125 whatever its stdin, before anything runs.
+    // A saas call without its credentials exits 125 before anything runs.
     let credentials = match args.backend {
         BackendKind::File => None,
         BackendKind::Saas => Some(saas::credentials()?),
     };
-    if let Some(kind) = uncacheable_stdin() {
-        warn(&format!(
-            "stdin is {kind}, so this call is not cached. End the command with `< /dev/null` to cache it"
-        ));
-        return Ok(run_uncached(&Supervisor::install()?, &args.command));
-    }
 
     let home = std::env::var_os("HOME")
         .filter(|h| !h.is_empty())
@@ -332,49 +324,6 @@ fn run_uncached(supervisor: &Supervisor, argv: &[std::ffi::OsString]) -> i32 {
         Ran::StatusUnknown { .. } => 126,
         Ran::Interrupted { signal } => 128 + signal,
     }
-}
-
-/// The key covers argv and `--scope` only, so only a call whose caller has
-/// shut stdin off is cached: `/dev/null`, or a closed fd 0 (which Rust's
-/// runtime reopens on `/dev/null` before `main`). A TTY carries whatever the
-/// user types, so it does not qualify. Returns what stdin is otherwise.
-fn uncacheable_stdin() -> Option<&'static str> {
-    let stdin = std::io::stdin();
-    let meta = match stdin
-        .as_fd()
-        .try_clone_to_owned()
-        .map(fs::File::from)
-        .and_then(|f| f.metadata())
-    {
-        Ok(meta) => meta,
-        Err(e) if e.raw_os_error() == Some(rustix::io::Errno::BADF.raw_os_error()) => return None,
-        Err(_) => return Some("not inspectable"),
-    };
-    let kind = meta.file_type();
-    if kind.is_char_device() {
-        let Ok(null) = fs::metadata("/dev/null") else {
-            // Without /dev/null to compare against, nothing proves stdin
-            // is empty.
-            return Some("not inspectable");
-        };
-        if meta.rdev() == null.rdev() {
-            return None;
-        }
-        return Some(if stdin.is_terminal() {
-            "a terminal"
-        } else {
-            "a character device"
-        });
-    }
-    Some(if kind.is_fifo() {
-        "a pipe"
-    } else if kind.is_socket() {
-        "a socket"
-    } else if kind.is_file() {
-        "a file"
-    } else {
-        "not /dev/null"
-    })
 }
 
 /// Take the fill lock, an exclusive `flock` on the key's lockfile. When it is

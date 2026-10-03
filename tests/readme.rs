@@ -6,7 +6,7 @@ mod common;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use common::{code, readme_sh_blocks, stderr, Sandbox, BIN};
 
@@ -27,13 +27,6 @@ fn readme_examples_run() {
     let ck_dir = Path::new(BIN).parent().unwrap();
 
     for example in examples {
-        for call in example.split("ck run").skip(1) {
-            let call = call.split([')', '\n']).next().unwrap_or_default();
-            assert!(
-                call.trim_end().ends_with("< /dev/null"),
-                "a ck run call without the redirect:\n{example}"
-            );
-        }
         // tests/saas.rs runs these against its fake CacheKit.
         if example.contains("--backend saas") {
             continue;
@@ -51,8 +44,10 @@ fn readme_examples_run() {
             .args(["-euc", &example])
             .env("HOME", s.home())
             .env("PATH", path)
+            // A pipe, as in CI, not /dev/null: the examples carry no redirect.
+            .stdin(Stdio::piped())
             .output()
             .unwrap();
-        assert_eq!(code(&out), 0, "{example}\n{}", stderr(&out));
+        assert_eq!((code(&out), stderr(&out)), (0, String::new()), "{example}");
     }
 }

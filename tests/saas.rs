@@ -506,13 +506,17 @@ fn slow_but_healthy_fills_and_hits() {
 }
 
 fn a_401_on_the_value_read_runs_uncached() {
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    file.write_all(b"from a file\n").unwrap();
     for exit in ["0", "5"] {
         let service = Service::new();
         let host = Sandbox::new();
         host.set("exit", exit);
+        host.set("stdin", "");
         let out = service
             .ck(&host, &[])
             .env(FAULT, "get=401")
+            .stdin(fs::File::open(file.path()).unwrap())
             .output()
             .unwrap();
 
@@ -530,6 +534,8 @@ fn a_401_on_the_value_read_runs_uncached() {
             assert!(warnings[0].contains(fix), "no {fix:?} in {warnings:?}");
         }
         assert_eq!(host.runs(), 1);
+        // Running uncached, the command still gets an empty stdin.
+        assert_eq!(host.read("stdin.out"), "EOF\n");
         assert_eq!(service.calls(), ["get value"]);
     }
 }
@@ -605,8 +611,7 @@ fn unusable_api_keys_exit_125() {
             Some(k) => cmd.env("CACHEKIT_API_KEY", k),
             None => cmd.env_remove("CACHEKIT_API_KEY"),
         };
-        // Stdin that would otherwise run the command uncached.
-        let out = cmd.stdin(std::process::Stdio::piped()).output().unwrap();
+        let out = cmd.output().unwrap();
         assert_eq!(code(&out), 125, "{key:?}: {}", stderr(&out));
         assert!(stderr(&out).contains(says), "{key:?}: {}", stderr(&out));
     }
@@ -648,6 +653,8 @@ fn readme_saas_examples_run() {
                 .env(FAKE, service.0.path())
                 .env("CACHEKIT_API_KEY", "ck_sdk_test")
                 .env("CACHEKIT_MASTER_KEY", MASTER_KEY_HEX)
+                // A pipe, as in CI, not /dev/null: the examples carry no redirect.
+                .stdin(std::process::Stdio::piped())
                 .output()
                 .unwrap()
         };

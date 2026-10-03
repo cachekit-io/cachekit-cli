@@ -12,7 +12,7 @@ is not repeated. A typical use is a secret read in a shell startup file, where
 every new shell would otherwise call the secret manager again:
 
 ```sh
-API_TOKEN="$(ck run --ttl 12h --stale 7d -- op read op://Private/api/token < /dev/null)"
+API_TOKEN="$(ck run --ttl 12h --stale 7d -- op read op://Private/api/token)"
 export API_TOKEN
 ```
 
@@ -55,7 +55,7 @@ prints nothing and exits with the failed run's code. `--refresh` runs the
 command whatever the backoff says:
 
 ```sh
-ck run --refresh -- date -u < /dev/null
+ck run --refresh -- date -u
 ```
 
 Concurrent calls for the same command on one machine run it once: the first
@@ -67,24 +67,24 @@ output passes the limit. With `--backend saas` the backoff is shared by every
 host, but the lock is not, so hosts that miss at the same moment each run the
 command.
 
-### stdin must be `/dev/null`
+### The command does not get your stdin
 
-The cache key covers the command line and `--scope`, not what arrives on
-stdin. So ck caches a call only when stdin is `/dev/null` (or closed). With a
-terminal, a pipe, a file or a socket on stdin, ck runs the command uncached and
-prints one warning. That is why every example here ends in `< /dev/null`.
-Programs that prompt by opening the terminal themselves, as `op`, `ssh` and
-`sudo` do, still reach you with stdin redirected.
+ck runs the command with an empty stdin (`/dev/null`), whatever ck's own stdin
+is, and never reads its own. The cache key does not cover stdin, so this is
+what lets a call cache the same way from a terminal, a pipe, CI or an agent's
+shell. Pass input in arguments, files or `--scope` instead. Programs that
+prompt by opening the terminal themselves, as `op`, `ssh` and `sudo` do, still
+reach you.
 
 ### What the key does not cover
 
 The key is the command and its arguments, plus `--scope`. It does not cover
 the environment, the working directory, the contents of files the command
-reads, or the network. Redirecting stdin to `/dev/null` is your assertion that
-none of those change the output. When one does, put it in `--scope`:
+reads, or the network. Wrapping a command in ck is your assertion that none of
+those change the output. When one does, put it in `--scope`:
 
 ```sh
-ck run --ttl 1h --scope "$PWD" -- ls < /dev/null
+ck run --ttl 1h --scope "$PWD" -- ls
 ```
 
 ### Wrap the command itself
@@ -92,7 +92,7 @@ ck run --ttl 1h --scope "$PWD" -- ls < /dev/null
 Run the command directly rather than through `sh -c`:
 
 ```sh
-ck run --ttl 5m -- uname -a < /dev/null
+ck run --ttl 5m -- uname -a
 ```
 
 When ck cannot start the command at all (it is not installed, or not
@@ -153,7 +153,7 @@ it. It needs two variables:
 Give every host that shares the cache the same two values:
 
 ```sh
-ck run --backend saas --ttl 12h --stale 1d -- date -u +%F < /dev/null
+ck run --backend saas --ttl 12h --stale 1d -- date -u +%F
 ```
 
 **The master key is the trust boundary.** Every host that holds it can store

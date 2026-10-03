@@ -233,8 +233,10 @@ impl Supervisor {
     }
 
     /// Run `argv` with every `CACHEKIT_*` variable removed from its
-    /// environment. stdin and stderr pass straight through. stdout is
-    /// captured up to `capture` bytes when it is set, else inherited.
+    /// environment, and stdin on `/dev/null`. The key does not cover stdin, so
+    /// the command never gets ck's: that makes every call cacheable whatever
+    /// ck's stdin is. stderr passes straight through. stdout is captured up
+    /// to `capture` bytes when it is set, else inherited.
     pub fn run(&self, argv: &[OsString], capture: Option<usize>) -> Ran {
         let mut command = Command::new(&argv[0]);
         command.args(&argv[1..]);
@@ -245,6 +247,7 @@ impl Supervisor {
                 command.env_remove(name);
             }
         }
+        command.stdin(Stdio::null());
         if capture.is_some() {
             command.stdout(Stdio::piped());
         }
