@@ -2,8 +2,44 @@
 
 `ck`, the command-line client for [CacheKit](https://cachekit.io).
 
-Pre-release: nothing is published yet. To try it, build from a checkout with
-`cargo build --release` and put `target/release/ck` on your `PATH`.
+## Install
+
+There is no install script. Install with Cargo, or download a release binary
+and verify where it came from.
+
+### With Cargo
+
+```text
+cargo install --locked cachekit-cli
+```
+
+This builds `ck` from the crate on crates.io and puts it in `~/.cargo/bin`.
+Each crates.io release is published by this repository's release workflow.
+
+### Release binaries
+
+Each [release](https://github.com/cachekit-io/cachekit-cli/releases) carries
+static Linux binaries for `x86_64` and `aarch64`, and a macOS binary for Apple
+silicon. On other platforms, install with Cargo. Download the archive for your
+platform, then verify it with the [GitHub CLI](https://cli.github.com/) before
+you unpack it:
+
+```text
+gh attestation verify ck-v0.1.0-x86_64-unknown-linux-musl.tar.gz --repo cachekit-io/cachekit-cli \
+  --signer-workflow cachekit-io/cachekit-cli/.github/workflows/release.yml \
+  --deny-self-hosted-runners
+```
+
+The check passes only if the file was built by this repository's release
+workflow on a GitHub-hosted runner. `--owner cachekit-io` alone is not enough:
+it accepts a file built by any workflow in any `cachekit-io` repository. The
+`ck` binary inside the archive is attested too, so the same command verifies it
+after unpacking.
+
+### From a checkout
+
+Build with `cargo build --release --locked` and put `target/release/ck` on
+your `PATH`.
 
 ## `ck run`
 
