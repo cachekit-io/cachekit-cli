@@ -36,9 +36,13 @@ jobs:
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
+    # On a dispatch the steps skip but the job still succeeds: a release
+    # created here would otherwise lose its build to the dispatched tag, and a
+    # skipped job would skip every job after it.
     steps:
       # The App token, not GITHUB_TOKEN, opens the release PR, so CI runs on it.
       - uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
+        if: github.event_name == 'push'
         id: app-token
         with:
           app-id: ${{ secrets.APP_ID }}
@@ -49,6 +53,7 @@ jobs:
           permission-issues: write
 
       - uses: googleapis/release-please-action@16a9c90856f42705d54a6fda1823352bdc62cf38 # v4
+        if: github.event_name == 'push'
         id: release
         with:
           token: ${{ steps.app-token.outputs.token }}
@@ -60,7 +65,11 @@ jobs:
           GH_REPO: ${{ github.repository }}
           # Via env: the PR JSON carries branch and title text.
           PR_JSON: ${{ steps.release.outputs.pr }}
-        run: gh pr edit "$(jq -er .number <<< "$PR_JSON")" --add-assignee 27Bslash6
+        # REST, not gh pr edit, which also queries project fields an App
+        # token cannot read.
+        run: |
+          number=$(jq -er .number <<< "$PR_JSON")
+          gh api --method POST "repos/$GH_REPO/issues/$number/assignees" -f "assignees[]=27Bslash6" > /dev/null
 
   check:
     needs: release-please
@@ -71,6 +80,7 @@ jobs:
     timeout-minutes: 15
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
+      sha: ${{ steps.sha.outputs.sha }}
     env:
       # A dispatch names the tag; a push releases what release-please created.
       TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || needs.release-please.outputs.tag_name }}
@@ -86,16 +96,20 @@ jobs:
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ steps.tag.outputs.tag }}
+          # Fully qualified, so a branch with the tag's name is never built.
+          ref: refs/tags/${{ steps.tag.outputs.tag }}
           fetch-depth: 0
           persist-credentials: false
 
       - name: Tagged commit is on main
+        id: sha
         # A dispatch can name any tag; only one on main may be built and
-        # attested as a run from main.
+        # attested as a run from main. Later jobs check out this exact commit,
+        # so a tag moved after this check cannot change what ships.
         run: |
           git merge-base --is-ancestor HEAD origin/main \
             || { echo "::error::$TAG is not on main"; exit 1; }
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Tag matches the crate version
         run: |
@@ -127,7 +141,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.check.outputs.tag }}
+          ref: ${{ needs.check.outputs.sha }}
           persist-credentials: false
 
       - name: Install the musl toolchain
@@ -206,7 +220,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.check.outputs.tag }}
+          ref: ${{ needs.check.outputs.sha }}
           persist-credentials: false
 
       # Needs the crate to exist on crates.io with this workflow and the
