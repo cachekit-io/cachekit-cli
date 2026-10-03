@@ -43,7 +43,8 @@ impl Sandbox {
 
     /// A command on PATH that records each call, then prints the contents of
     /// `out` (default `hello`) and exits with the code in `exit` (default 0).
-    /// `sleep` and `env` files make it sleep first or dump its environment;
+    /// `sleep`, `env` and `stdin` files make it sleep first, dump its
+    /// environment, or copy what it reads on stdin, then `EOF`, to `stdin.out`;
     /// `selfkill` (holding a signal name) makes it send that signal to itself.
     pub fn install_shim(&self, name: &str) {
         let r = self.root.path().display();
@@ -53,6 +54,7 @@ impl Sandbox {
              [ -f '{r}/sleep' ] && sleep \"$(cat '{r}/sleep')\"\n\
              [ -f '{r}/selfkill' ] && kill -\"$(cat '{r}/selfkill')\" $$\n\
              [ -f '{r}/env' ] && env > '{r}/env.out'\n\
+             [ -f '{r}/stdin' ] && {{ cat; echo EOF; }} > '{r}/stdin.out'\n\
              if [ -f '{r}/out' ]; then cat '{r}/out'; else echo hello; fi\n\
              exit \"$(cat '{r}/exit' 2>/dev/null || echo 0)\"\n"
         );

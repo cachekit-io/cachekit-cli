@@ -13,8 +13,8 @@ pub const MAX_RETENTION_SECS: u64 = 30 * 86_400;
 pub const USAGE: &str = "\
 usage: ck run [--backend file|saas] [--ttl D] [--stale D] [--scope S] [--refresh] -- <command> [args...]
 
-Runs <command> and caches its stdout when it exits 0. Only a call whose stdin
-is /dev/null is cached, so end every cached call with `< /dev/null`.
+Runs <command> and caches its stdout when it exits 0. The command gets an empty
+stdin, never ck's: pass input in arguments, files or --scope.
 
   --backend B     where entries live: file (default, in ~/.cache/ck) or saas
                   (CacheKit, shared across hosts; needs CACHEKIT_API_KEY and

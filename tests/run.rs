@@ -223,9 +223,12 @@ fn lowering_stale_stops_an_old_entry_being_served() {
 }
 
 #[test]
-fn only_dev_null_stdin_is_cached() {
-    let file = tempfile::NamedTempFile::new().unwrap();
-    // Each stdin comes with whatever must stay open while ck runs.
+fn the_command_gets_an_empty_stdin_whatever_cks_is() {
+    use std::io::Write;
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    file.write_all(b"from a file\n").unwrap();
+    // Each stdin holds data, and comes with whatever must stay open while ck
+    // runs. A pipe's data is written once ck is running.
     let stdin_for = |kind: &str| -> (Stdio, Option<std::os::fd::OwnedFd>) {
         match kind {
             "a terminal" => {
@@ -239,46 +242,71 @@ fn only_dev_null_stdin_is_cached() {
                     .write(true)
                     .open(name.to_str().unwrap())
                     .unwrap();
+                // What the user typed, waiting to be read.
+                rustix::io::write(&master, b"typed\n").unwrap();
                 (Stdio::from(slave), Some(master))
             }
             "a pipe" => (Stdio::piped(), None),
             "a socket" => {
                 let (a, b) = UnixStream::pair().unwrap();
+                (&b).write_all(b"from a socket\n").unwrap();
                 (Stdio::from(std::os::fd::OwnedFd::from(a)), Some(b.into()))
             }
             _ => (Stdio::from(fs::File::open(file.path()).unwrap()), None),
         }
     };
-    let cases = ["a terminal", "a pipe", "a socket", "a file"];
-
-    for kind in cases {
+    for kind in ["a terminal", "a pipe", "a socket", "a file"] {
         let s = Sandbox::new();
+        s.set("stdin", "");
         for call in 1..=2 {
             let (stdin, _keep) = stdin_for(kind);
-            let out = s
-                .ck(&["run", "--", "origin"])
+            let mut child = s
+                .ck(&["run", "--ttl", "1h", "--", "origin"])
                 .stdin(stdin)
-                .output()
+                .spawn()
                 .unwrap();
-            assert_eq!(code(&out), 0, "{kind}");
-            let err = stderr(&out);
-            assert_eq!(err.lines().count(), 1, "{kind}: {err}");
-            assert!(
-                err.contains(kind) && err.contains("< /dev/null"),
-                "{kind}: {err}"
+            if let Some(mut pipe) = child.stdin.take() {
+                pipe.write_all(b"from a pipe\n").unwrap();
+            }
+            // A command handed ck's terminal or socket would wait on it forever.
+            let msg = format!("{kind}: the command waited on ck's stdin");
+            wait_exit(&mut child, Duration::from_secs(5), &msg);
+            let out = child.wait_with_output().unwrap();
+            assert_eq!(
+                (code(&out), stdout(&out), stderr(&out)),
+                (0, "hello\n".into(), String::new()),
+                "{kind}, call {call}"
             );
-            assert_eq!(s.runs(), call, "{kind}: the call was cached");
         }
-        assert!(
-            !s.home().join(".cache").exists(),
-            "{kind}: an uncached call touched the cache"
+        assert_eq!(s.runs(), 1, "{kind}: the second call did not hit");
+        assert_eq!(
+            s.read("stdin.out"),
+            "EOF\n",
+            "{kind}: the command read stdin"
         );
+        // Stdin is not in the key: a call with `< /dev/null` hits the same entry.
+        let out = s.run(&["--ttl", "1h"]);
+        assert_eq!((code(&out), s.runs()), (0, 1), "{kind}: /dev/null missed");
     }
+}
 
+#[test]
+fn a_pipe_that_never_closes_does_not_hang_ck() {
     let s = Sandbox::new();
-    s.run(&[]);
-    let out = s.run(&[]);
-    assert_eq!((stderr(&out), s.runs()), (String::new(), 1));
+    s.set("stdin", "");
+    for _ in 1..=2 {
+        let mut child = s
+            .ck(&["run", "--ttl", "1h", "--", "origin"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // The writer stays open and never writes.
+        let _writer = child.stdin.take();
+        let status = wait_exit(&mut child, Duration::from_secs(5), "ck hung on its stdin");
+        assert!(status.success());
+    }
+    assert_eq!(s.runs(), 1);
+    assert_eq!(s.read("stdin.out"), "EOF\n");
 }
 
 #[test]
