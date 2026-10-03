@@ -112,18 +112,16 @@ impl Call<'_> {
                 });
                 // The marker only adds to the stderr line, so a failed read
                 // still serves stale: the lock holder is running the command.
-                let marker = match self.store.marker(&self.marker_key) {
-                    Ok(m) => m,
+                // The cause joins that one line.
+                let (marker, unavailable) = match self.store.marker(&self.marker_key) {
+                    Ok(m) => (m, None),
                     Err(ReadError::Local(fatal)) => return Err(fatal),
-                    Err(ReadError::Backend(e)) => {
-                        warn(&format!("the cache is unavailable ({e})"));
-                        None
-                    }
+                    Err(ReadError::Backend(e)) => (None, Some(e)),
                 };
                 if let Some(code) = supervisor.interrupted() {
                     return Ok(code);
                 }
-                return Ok(self.serve_stale(&stale, marker.as_ref(), None));
+                return Ok(self.serve_stale(&stale, marker.as_ref(), None, unavailable));
             }
             Err(e) => {
                 warn(&format!(
@@ -135,8 +133,10 @@ impl Call<'_> {
         };
 
         // Holding the lock: whoever held it before may have filled the value.
-        let (value, marker) = match self.store.value_and_marker(&self.key, &self.marker_key) {
-            Ok(pair) => pair,
+        // A fresh value wins even if the marker read failed.
+        let (value, marker) = self.store.value_and_marker(&self.key, &self.marker_key);
+        let value = match value {
+            Ok(v) => v,
             Err(e) => return self.read_failed(e, &supervisor),
         };
         let stale = match self.fresh_or_stale(value) {
@@ -149,13 +149,17 @@ impl Call<'_> {
             }
             ControlFlow::Continue(stale) => stale,
         };
+        let marker = match marker {
+            Ok(m) => m,
+            Err(e) => return self.read_failed(e, &supervisor),
+        };
         let now = now_ms();
         if let Some(m) = marker.filter(|m| m.is_active(now)) {
             if let Some(code) = supervisor.interrupted() {
                 return Ok(code);
             }
             if let Some(stale) = stale {
-                return Ok(self.serve_stale(&stale, Some(&m), None));
+                return Ok(self.serve_stale(&stale, Some(&m), None, None));
             }
             warn(&format!(
                 "not running the command: its last run exited {}; next retry in {}. Use --refresh to run it now",
@@ -190,14 +194,16 @@ impl Call<'_> {
                 // no marker is set or bumped. `Supervisor::run` has already
                 // turned a received signal into `Interrupted`.
                 return match stale {
-                    Some(stale) => self.serve_stale(&stale, None, None),
+                    Some(stale) => self.serve_stale(&stale, None, None, None),
                     None => code,
                 };
             }
             Ran::Interrupted { signal } => return 128 + signal,
             Ran::StatusUnknown { stdout } => {
                 return match (stale, stdout) {
-                    (Some(stale), Stdout::Captured(_)) => self.serve_stale(&stale, None, None),
+                    (Some(stale), Stdout::Captured(_)) => {
+                        self.serve_stale(&stale, None, None, None)
+                    }
                     (_, stdout) => {
                         stdout.emit_captured();
                         126
@@ -213,7 +219,17 @@ impl Call<'_> {
                 Stdout::Captured(out) => {
                     // Print before the write-back, so a pipeline sees output at once.
                     emit(out);
-                    Some(Envelope::encode(now, out))
+                    match self.store.max_output() {
+                        Some(max) if out.len() > max => {
+                            warn(&format!(
+                                "the output is {}, over the {} that --backend saas stores, so it was not cached",
+                                size(out.len()),
+                                size(max)
+                            ));
+                            None
+                        }
+                        _ => Some(Envelope::encode(now, out)),
+                    }
                 }
                 _ => None,
             };
@@ -225,12 +241,16 @@ impl Call<'_> {
                 &self.marker_key,
             );
             // One warning: a failed write and a failed clear usually share a cause.
-            if let Err(e) = stored {
-                warn(&format!(
+            match (stored, cleared) {
+                (Err(e), Err(_)) => warn(&format!(
+                    "the command succeeded but its output was not cached: {e}; \
+                     any recorded failure still stands, so the next call may not run it"
+                )),
+                (Err(e), Ok(())) => warn(&format!(
                     "the command succeeded but its output was not cached: {e}"
-                ));
-            } else if let Err(e) = cleared {
-                warn(&format!("cannot clear the recorded failure: {e}"));
+                )),
+                (Ok(()), Err(e)) => warn(&format!("cannot clear the recorded failure: {e}")),
+                (Ok(()), Ok(())) => {}
             }
             return 0;
         }
@@ -248,7 +268,9 @@ impl Call<'_> {
             warn(&format!("cannot record the failure: {e}"));
         }
         match (stdout, stale) {
-            (Stdout::Captured(_), Some(stale)) => self.serve_stale(&stale, Some(&next), Some(code)),
+            (Stdout::Captured(_), Some(stale)) => {
+                self.serve_stale(&stale, Some(&next), Some(code), None)
+            }
             (stdout, _) => {
                 stdout.emit_captured();
                 code
@@ -269,8 +291,15 @@ impl Call<'_> {
         }
     }
 
-    /// Replay a stored exit-0 run with exit 0 and one stderr line.
-    fn serve_stale(&self, stale: &Stale, marker: Option<&Marker>, failed_now: Option<i32>) -> i32 {
+    /// Replay a stored exit-0 run with exit 0 and one stderr line, which ends
+    /// with `unavailable`, the backend error, when there was one.
+    fn serve_stale(
+        &self,
+        stale: &Stale,
+        marker: Option<&Marker>,
+        failed_now: Option<i32>,
+        unavailable: Option<String>,
+    ) -> i32 {
         let now = now_ms();
         let mut line = match failed_now {
             Some(code) => format!(
@@ -284,6 +313,9 @@ impl Call<'_> {
                 line.push_str(&format!("; the last run exited {}", m.exit));
             }
             line.push_str(&format!("; next retry in {}", human(m.retry_at_ms - now)));
+        }
+        if let Some(e) = unavailable {
+            line.push_str(&format!("; the cache is unavailable ({e})"));
         }
         warn(&line);
         emit(&stale.envelope.stdout);
@@ -383,5 +415,15 @@ fn fill_lock(path: &Path, wait: bool) -> std::io::Result<Option<OwnedFd>> {
             Err(rustix::io::Errno::INTR) => {}
             Err(e) => return Err(e.into()),
         }
+    }
+}
+
+/// `1 MiB`-style rendering for stderr lines.
+fn size(bytes: usize) -> String {
+    const MIB: usize = 1024 * 1024;
+    if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64).replace(".0 ", " ")
+    } else {
+        format!("{} KiB", bytes.div_ceil(1024))
     }
 }

@@ -6,25 +6,25 @@ use cachekit::backend::Backend;
 use crate::keys::{self, MASTER_KEY_ENV};
 use crate::Fatal;
 
-pub const API_KEY_ENV: &str = "CACHEKIT_API_KEY";
+pub(crate) const API_KEY_ENV: &str = "CACHEKIT_API_KEY";
 
 /// Fixed in code. ck never reads `CACHEKIT_API_URL` and never allows a custom
 /// host, so a repository's `.envrc` cannot send a production key elsewhere.
-pub const API_URL: &str = "https://api.cachekit.io";
+pub(crate) const API_URL: &str = "https://api.cachekit.io";
 
 /// Builds the backend from an API key. [`crate::main`] uses [`connect`];
 /// tests pass a fake.
 pub type Connect = dyn Fn(&str) -> Result<Box<dyn Backend>, Fatal>;
 
-pub struct Credentials {
-    pub api_key: String,
-    pub master_key: Vec<u8>,
+pub(crate) struct Credentials {
+    pub(crate) api_key: String,
+    pub(crate) master_key: Vec<u8>,
 }
 
 /// Both keys, from the environment. Either one missing or unusable is exit
 /// 125: saas never falls back to the file key, and a key that cannot write
 /// ck's namespace is refused before anything runs.
-pub fn credentials() -> Result<Credentials, Fatal> {
+pub(crate) fn credentials() -> Result<Credentials, Fatal> {
     let Some(master_key) = std::env::var_os(MASTER_KEY_ENV) else {
         return Err(Fatal(format!(
             "--backend saas needs {MASTER_KEY_ENV}, 64 hex characters from `openssl rand -hex 32`. \

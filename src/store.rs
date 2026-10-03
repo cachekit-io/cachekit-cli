@@ -15,7 +15,13 @@ use crate::{warn, Fatal};
 
 /// Each saas round trip gets this long. The cachekit-rs client's own
 /// timeouts (30 s per request, 10 s to connect) cannot be changed.
-pub const SAAS_DEADLINE: Duration = Duration::from_secs(1);
+pub(crate) const SAAS_DEADLINE: Duration = Duration::from_secs(1);
+
+/// The largest output ck stores on saas. The deadline covers the download
+/// too, so an entry one host can write must be one every host can read
+/// within it: past this size, a slow link would see a healthy backend time
+/// out on every call, and never recover while faster hosts keep it fresh.
+pub(crate) const SAAS_MAX_OUTPUT: usize = 1024 * 1024;
 
 /// Why a read produced no answer.
 pub enum ReadError {
@@ -87,19 +93,30 @@ impl Store {
             .and_then(Marker::decode))
     }
 
-    /// Both reads at once: one round trip of latency on saas.
+    /// Both reads at once: one round trip of latency on saas. The two can
+    /// fail independently, and a fresh value is served whatever happened to
+    /// the marker, so each keeps its own result.
+    #[allow(clippy::type_complexity)]
     pub fn value_and_marker(
         &self,
         key: &str,
         marker_key: &str,
-    ) -> Result<(Option<Envelope>, Option<Marker>), ReadError> {
+    ) -> (
+        Result<Option<Envelope>, ReadError>,
+        Result<Option<Marker>, ReadError>,
+    ) {
         let (value, marker) = self
             .runtime
             .block_on(async { tokio::join!(self.get(key), self.get(marker_key)) });
-        Ok((
-            value?.and_then(Envelope::decode),
-            marker?.as_deref().and_then(Marker::decode),
-        ))
+        (
+            value.map(|v| v.and_then(Envelope::decode)),
+            marker.map(|m| m.as_deref().and_then(Marker::decode)),
+        )
+    }
+
+    /// The largest output this backend stores, if it has a limit.
+    pub fn max_output(&self) -> Option<usize> {
+        self.deadline.map(|_| SAAS_MAX_OUTPUT)
     }
 
     pub fn set(&self, key: &str, plaintext: &[u8], ttl: Duration) -> Result<(), String> {
@@ -196,12 +213,25 @@ impl Store {
     }
 }
 
-/// The error as one stderr line. A 401 or 403 also names the fix. The
-/// message can carry text from the server's response, so control characters
-/// are replaced and cannot end the line or drive the terminal.
+/// The error as one stderr line, with the chain of causes behind it: an HTTP
+/// client error names only the request, and the cause (a DNS failure, a
+/// refused connection, a certificate it does not trust) sits in its sources.
+/// A 401 or 403 also names the fix. The text can come from the server's
+/// response, so control characters are replaced and cannot end the line or
+/// drive the terminal.
 fn describe(e: &BackendError) -> String {
-    let text: String = e
-        .to_string()
+    let mut text = e.to_string();
+    let mut cause = std::error::Error::source(e);
+    while let Some(c) = cause {
+        let part = c.to_string();
+        // The client error's own text is already in the message.
+        if !text.contains(&part) {
+            text.push_str(": ");
+            text.push_str(&part);
+        }
+        cause = c.source();
+    }
+    let text: String = text
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
@@ -259,6 +289,35 @@ mod tests {
         );
         let e = BackendError::from_http_status(503, b"down");
         assert!(!describe(&e).contains("ck_sdk_"));
+    }
+
+    #[test]
+    fn the_cause_behind_a_client_error_is_named() {
+        #[derive(Debug)]
+        struct Wrapper(std::io::Error);
+        impl std::fmt::Display for Wrapper {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("error sending request")
+            }
+        }
+        impl std::error::Error for Wrapper {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let refused =
+            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "connection refused");
+        let e = BackendError {
+            kind: BackendErrorKind::Transient,
+            message: "error sending request".into(),
+            source: Some(Box::new(Wrapper(refused))),
+        };
+        let line = describe(&e);
+        assert!(
+            line.ends_with("error sending request: connection refused"),
+            "{line}"
+        );
+        assert_eq!(line.matches("error sending request").count(), 1, "{line}");
     }
 
     #[test]

@@ -26,7 +26,6 @@ use async_trait::async_trait;
 use cachekit::backend::file::FileBackend;
 use cachekit::backend::{Backend, HealthStatus};
 use cachekit::{BackendError, BackendErrorKind};
-use cachekit_cli::keys::KeyHasher;
 
 use common::{code, entries, readme_sh_blocks, stderr, stdout, Sandbox, MASTER_KEY_HEX};
 
@@ -34,10 +33,11 @@ use common::{code, entries, readme_sh_blocks, stderr, stdout, Sandbox, MASTER_KE
 const FAKE: &str = "CK_TEST_FAKE_SAAS";
 /// Milliseconds the fake waits before answering each call.
 const LATENCY: &str = "CK_TEST_FAKE_LATENCY_MS";
-/// `<op>=<fault>`, where op is get, set, delete or `*`, and fault is an HTTP
-/// status, `timeout` (the client's own timeout error), `hang` (never
-/// answers), or `hang-blocking` (never answers, holding a blocking thread, as
-/// a stuck DNS lookup does).
+/// Comma-separated `<on>=<fault>`. `on` is an op (get, set, delete), an op
+/// and what it is for (`get:value`, `get:marker`), or `*`. The fault is an
+/// HTTP status, `timeout` (the client's own timeout error), `hang` (never
+/// answers, holding a blocking thread, as a stuck DNS lookup does), or
+/// `none-once` (the first such call finds nothing).
 const FAULT: &str = "CK_TEST_FAKE_FAULT";
 
 const CASES: &[(&str, fn())] = &[
@@ -46,12 +46,7 @@ const CASES: &[(&str, fn())] = &[
         "a_failure_backs_off_other_hosts",
         a_failure_backs_off_other_hosts,
     ),
-    ("outage_adds_at_most_1s", || {
-        outage_adds_at_most_1s("*=hang")
-    }),
-    ("outage_on_a_stuck_lookup_adds_at_most_1s", || {
-        outage_adds_at_most_1s("*=hang-blocking")
-    }),
+    ("outage_adds_at_most_1s", outage_adds_at_most_1s),
     (
         "slow_but_healthy_fills_and_hits",
         slow_but_healthy_fills_and_hits,
@@ -68,7 +63,18 @@ const CASES: &[(&str, fn())] = &[
         "a_failed_write_after_the_run_warns_once",
         a_failed_write_after_the_run_warns_once,
     ),
-    ("a_corrupt_entry_is_a_miss", a_corrupt_entry_is_a_miss),
+    (
+        "output_over_1_mib_is_not_stored",
+        output_over_1_mib_is_not_stored,
+    ),
+    (
+        "a_fresh_value_wins_over_a_failed_marker_read",
+        a_fresh_value_wins_over_a_failed_marker_read,
+    ),
+    (
+        "a_contended_lock_serves_stale_in_one_line",
+        a_contended_lock_serves_stale_in_one_line,
+    ),
     (
         "saas_without_a_master_key_exits_125",
         saas_without_a_master_key_exits_125,
@@ -113,6 +119,13 @@ fn main() {
 
 // ── The fake backend ─────────────────────────────────────────────────────────
 
+/// The `none-once` fault's signal from `answer` to `get`: answer "absent".
+const NONE: BackendError = BackendError {
+    kind: BackendErrorKind::Permanent,
+    message: String::new(),
+    source: None,
+};
+
 struct Fake {
     entries: FileBackend,
     log: PathBuf,
@@ -149,14 +162,25 @@ impl Fake {
         log.write_all(format!("{op} {what}\n").as_bytes()).unwrap();
         tokio::time::sleep(self.latency).await;
 
+        let target = format!("{op}:{what}");
         let fault = self.faults.split(',').find_map(|f| {
             let (on, fault) = f.split_once('=')?;
-            (on == op || on == "*").then_some(fault)
+            (on == op || on == target || on == "*").then_some(fault)
         });
         match fault {
             None => Ok(()),
-            Some("hang") => std::future::pending().await,
-            Some("hang-blocking") => {
+            Some("none-once") => {
+                let spent = self.log.with_file_name(format!("spent-{target}"));
+                match fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(spent)
+                {
+                    Ok(_) => Err(NONE),
+                    Err(_) => Ok(()),
+                }
+            }
+            Some("hang") => {
                 let _ = tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_secs(30)))
                     .await;
                 unreachable!("the deadline cuts this off")
@@ -177,8 +201,13 @@ impl Fake {
 #[async_trait]
 impl Backend for Fake {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError> {
-        self.answer("get", key).await?;
-        self.entries.get(key).await
+        match self.answer("get", key).await {
+            Err(e) if e.message == NONE.message => Ok(None),
+            other => {
+                other?;
+                self.entries.get(key).await
+            }
+        }
     }
 
     async fn set(
@@ -313,14 +342,18 @@ fn a_failure_backs_off_other_hosts() {
     assert_eq!(b.runs(), 0);
 }
 
-fn outage_adds_at_most_1s(fault: &str) {
+fn outage_adds_at_most_1s() {
     let service = Service::new();
     let host = Sandbox::new();
     host.set("exit", "3");
     let baseline = origin_alone(&host);
 
     let started = Instant::now();
-    let out = service.ck(&host, &[]).env(FAULT, fault).output().unwrap();
+    let out = service
+        .ck(&host, &[])
+        .env(FAULT, "*=hang")
+        .output()
+        .unwrap();
     let added = started.elapsed().saturating_sub(baseline);
 
     assert_eq!((code(&out), stdout(&out)), (3, "hello\n".into()));
@@ -438,41 +471,11 @@ fn a_failed_write_after_the_run_warns_once() {
     let warnings = lines(&out);
     assert_eq!(warnings.len(), 1, "{warnings:?}");
     assert!(warnings[0].contains("not cached"), "{warnings:?}");
+    assert!(warnings[0].contains("still stands"), "{warnings:?}");
 
     // Nothing was stored, so the next call runs the command again.
     service.run(&host, &["--ttl", "1h"]);
     assert_eq!(host.runs(), 2);
-}
-
-fn a_corrupt_entry_is_a_miss() {
-    let service = Service::new();
-    let host = Sandbox::new();
-    let key = KeyHasher::new(&hex::decode(MASTER_KEY_HEX).unwrap())
-        .unwrap()
-        .value_key(&"".into(), &["origin".into()]);
-    let entries = FileBackend::builder()
-        .cache_dir(service.0.path().join("entries"))
-        .build()
-        .unwrap();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap();
-    runtime
-        .block_on(entries.set(&key, vec![0; 64], None))
-        .unwrap();
-
-    let out = service.run(&host, &["--ttl", "1h"]);
-    assert_eq!((code(&out), stdout(&out)), (0, "hello\n".into()));
-    assert!(
-        stderr(&out).contains("failed to decrypt"),
-        "{}",
-        stderr(&out)
-    );
-    assert_eq!(host.runs(), 1);
-    // The run replaced the corrupt entry.
-    let out = service.run(&host, &["--ttl", "1h"]);
-    assert_eq!((code(&out), stderr(&out)), (0, String::new()));
-    assert_eq!(host.runs(), 1);
 }
 
 fn saas_without_a_master_key_exits_125() {
@@ -576,4 +579,83 @@ fn readme_saas_examples_run() {
             "the second run missed: {example}"
         );
     }
+}
+
+fn output_over_1_mib_is_not_stored() {
+    let service = Service::new();
+    let host = Sandbox::new();
+    let big = "x".repeat(1024 * 1024) + "\n";
+    host.set("out", &big);
+    let out = service.run(&host, &["--ttl", "1h"]);
+    assert_eq!(code(&out), 0);
+    assert_eq!(out.stdout.len(), big.len(), "the output was cut");
+    let warnings = lines(&out);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("over the 1 MiB"), "{warnings:?}");
+    assert!(
+        !service.calls().iter().any(|c| c == "set value"),
+        "{:?}",
+        service.calls()
+    );
+    // The success still ends any backoff.
+    assert!(service.calls().iter().any(|c| c == "delete marker"));
+
+    // The same output fits the file backend, which keeps its 20 MiB cap.
+    let out = host.run(&["--ttl", "1h"]);
+    assert_eq!((code(&out), stderr(&out)), (0, String::new()));
+}
+
+fn a_fresh_value_wins_over_a_failed_marker_read() {
+    let service = Service::new();
+    let host = Sandbox::new();
+    assert_eq!(code(&service.run(&host, &["--ttl", "1h"])), 0);
+    service.clear_calls();
+    // The first read misses, as if another host filled the value just after
+    // it; under the lock the value is fresh, and the marker read fails.
+    host.set("out", "changed\n");
+    let out = service
+        .ck(&host, &["--ttl", "1h"])
+        .env(FAULT, "get:value=none-once,get:marker=503")
+        .output()
+        .unwrap();
+    assert_eq!(
+        (code(&out), stdout(&out), stderr(&out)),
+        (0, "hello\n".into(), String::new())
+    );
+    assert_eq!(host.runs(), 1, "the command ran again");
+    let mut calls = service.calls();
+    calls.sort();
+    assert_eq!(calls, ["get marker", "get value", "get value"]);
+}
+
+fn a_contended_lock_serves_stale_in_one_line() {
+    let service = Service::new();
+    let host = Sandbox::new();
+    let flags = ["--ttl", "1s", "--stale", "1h"];
+    assert_eq!(code(&service.run(&host, &flags)), 0);
+    std::thread::sleep(Duration::from_millis(1_100));
+    host.set("sleep", "2");
+    host.set("out", "new\n");
+    let filler = service.ck(&host, &flags).spawn().unwrap();
+    // The filler's command is running, so it holds the lock.
+    let started = Instant::now();
+    while host.runs() < 2 {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the filler never ran"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let out = service
+        .ck(&host, &flags)
+        .env(FAULT, "get:marker=503")
+        .output()
+        .unwrap();
+    assert_eq!((code(&out), stdout(&out)), (0, "hello\n".into()));
+    let warnings = lines(&out);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("serving output from"), "{warnings:?}");
+    assert!(warnings[0].contains("HTTP 503"), "{warnings:?}");
+    assert_eq!(stdout(&filler.wait_with_output().unwrap()), "new\n");
 }

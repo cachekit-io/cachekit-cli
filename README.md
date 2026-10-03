@@ -60,7 +60,10 @@ ck run --refresh -- date -u < /dev/null
 
 Concurrent calls for the same command on one machine run it once: the first
 takes a lock and the rest wait for its result, or serve stale output if they
-have it. Output larger than 20 MiB is passed through and not cached. With
+have it. Output larger than 20 MiB is passed through and not cached; with
+`--backend saas` the limit is 1 MiB, so that every host can read an entry back
+within its 1-second request deadline. Output over the limit is printed in full,
+with one warning. With
 `--backend saas` the backoff is shared by every host, but the lock is not, so
 hosts that miss at the same moment each run the command.
 
@@ -110,8 +113,10 @@ To stop serving old output:
 - delete `~/.cache/ck` to remove every entry;
 - delete `~/.config/ck/file.key`, or change `CACHEKIT_MASTER_KEY` if you set
   one, to make every stored entry unreadable. This is the purge for
-  `--backend saas`: a new master key moves every host to a fresh set of
-  entries at once.
+  `--backend saas`: once a host has the new key, it can no longer read any
+  entry stored under the old one. A host still on the old key keeps reading
+  them, and CacheKit keeps the old entries until they expire, at most `--ttl`
+  plus `--stale` after they were written.
 
 ### Encryption and the file key
 
@@ -164,7 +169,9 @@ output from another's, and `--scope` does not separate holders either. So:
 
 **A CacheKit fault never stops your command.** When CacheKit cannot answer, or
 answers with an error, ck runs the command uncached and prints one warning
-naming the cause. That covers an outage, a timeout, and a rejected key
+naming the cause. When another call on the same machine is already running
+the command and this one has stale output it may serve, ck serves that
+output instead, with the cause on its one stderr line. That covers an outage, a timeout, and a rejected key
 (revoked, rotated or missing the `ck-run` grant), whose warning also names the
 fix. Each request to CacheKit gets 1 second: a call adds at most 1 second when
 CacheKit is down, and a first call that stores its output adds at most 3. On a
