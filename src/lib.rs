@@ -60,6 +60,28 @@ pub(crate) fn warn(message: &str) {
     let _ = writeln!(std::io::stderr(), "ck: {message}");
 }
 
+/// Whether `CK_LOG=debug` asks for one `ck: debug:` line per call. An env var
+/// rather than a flag, so one export reaches every call site, nested ones
+/// included. Not `RUST_LOG`, which the wrapped command also reads, and not
+/// `CACHEKIT_*`, which is stripped from it. Any other non-empty value warns and
+/// is otherwise ignored: a typo exported from a shell startup file must not
+/// break every cached command.
+pub(crate) fn debug_enabled() -> bool {
+    match std::env::var_os("CK_LOG") {
+        Some(v) if v == "debug" => true,
+        Some(v) if !v.is_empty() => {
+            warn("ignoring CK_LOG: the only accepted value is debug");
+            false
+        }
+        _ => false,
+    }
+}
+
+/// One debug line on stderr, dropped on a failed write as [`warn`] is.
+pub(crate) fn debug(message: &str) {
+    let _ = writeln!(std::io::stderr(), "ck: debug: {message}");
+}
+
 /// Write to stdout, and say whether it worked. A reader that has gone away
 /// (EPIPE) is normal in a pipeline and stays silent; any other failure is
 /// reported.

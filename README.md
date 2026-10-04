@@ -272,6 +272,39 @@ other failure. A signal ck inherits as ignored, as under `nohup`, stays
 ignored: ck neither forwards it nor stops for it, and the command inherits it
 ignored too.
 
+### Seeing what ck did
+
+A hit and a stored miss print nothing, so you cannot tell from the output
+whether ck served the stored output or ran the command. Set `CK_LOG=debug` and
+every `ck run` call prints one more line on stderr saying what it did. Export
+it once, and the calls in your shell startup files and scripts report too:
+
+```console
+$ CK_LOG=debug ck run --ttl 12h -- op item get api --fields token --reveal
+ck: debug: served fresh: backend=file program="op" entry=ab6888403fb1 age=2873104ms exit=0 elapsed=1ms
+```
+
+The line starts with what happened: `served fresh`, `served stale`,
+`ran and stored`, `ran, not stored` (the command failed, or its output was too
+large or could not be written), `refreshed and stored` or `refreshed, not stored`
+(`--refresh`), `suppressed` (backing off after a failure), `ran uncached` (the
+cache was unavailable), or `could not start the command`. Then come the backend,
+the program name, the entry id, the stored output's age when ck read one, ck's
+exit code and how long the call took. Any warning ck prints for the call comes
+first and is unchanged. An interrupted call may print no debug line.
+
+The line names only the program, never its arguments: they can hold a secret,
+as can the output, which is never logged either, and neither key is. The entry
+id is the first 12 characters of the entry's lock file name in
+`~/.cache/ck/locks/`. It comes from the keyed hash, so it cannot be matched
+against a guessed command without the master key.
+
+`CK_LOG` takes only `debug`. Any other non-empty value prints one warning and
+is otherwise ignored, so a typo never stops the command. ck reads `CK_LOG`
+rather than `RUST_LOG` because the wrapped command sees every variable ck does
+except `CACHEKIT_*`, so `RUST_LOG` would switch on a Rust program's own logs
+too. To keep the lines, redirect stderr: `2>>ck.log`.
+
 ### Platforms
 
 Linux and macOS. The cache directory must be on a local filesystem: on NFS or

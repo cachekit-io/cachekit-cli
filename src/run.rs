@@ -9,7 +9,7 @@ use std::ops::ControlFlow;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustix::fs::{FlockOperation, Mode, OFlags};
 
@@ -19,9 +19,11 @@ use crate::entry::{human, now_ms, Envelope, Freshness, Marker};
 use crate::keys::{self, KeyHasher};
 use crate::saas::{self, Connect};
 use crate::store::{ReadError, Store};
-use crate::{emit, warn, Fatal};
+use crate::{debug, emit, warn, Fatal};
 
 pub fn run(args: &RunArgs, connect: &Connect) -> Result<i32, Fatal> {
+    let started = Instant::now();
+    let debug = crate::debug_enabled();
     // A saas call without its credentials exits 125 before anything runs.
     let credentials = match args.backend {
         BackendKind::File => None,
@@ -55,6 +57,8 @@ pub fn run(args: &RunArgs, connect: &Connect) -> Result<i32, Fatal> {
         lock_path: cache_dir.join("locks").join(keys::key_hash(&key)),
         key,
         store,
+        debug,
+        started,
     };
     if args.refresh {
         return call.refresh();
@@ -68,6 +72,9 @@ struct Call<'a> {
     key: String,
     marker_key: String,
     lock_path: PathBuf,
+    /// `CK_LOG=debug`: each outcome reports itself through [`Call::done`].
+    debug: bool,
+    started: Instant,
 }
 
 /// A stored run that may be replayed because the command failed.
@@ -83,9 +90,9 @@ impl Call<'_> {
             Err(e) => return self.read_failed(e, &Supervisor::install()?),
         };
         let stale = match self.fresh_or_stale(value) {
-            ControlFlow::Break(fresh) => {
+            ControlFlow::Break((fresh, age_ms)) => {
                 emit(&fresh);
-                return Ok(0);
+                return Ok(self.done("served fresh", Some(age_ms), 0));
             }
             ControlFlow::Continue(stale) => stale,
         };
@@ -120,7 +127,7 @@ impl Call<'_> {
                     "cannot take the fill lock {}: {e}; running uncached",
                     self.lock_path.display()
                 ));
-                return Ok(run_uncached(&supervisor, &self.args.command));
+                return Ok(self.run_uncached(&supervisor));
             }
         };
 
@@ -132,12 +139,12 @@ impl Call<'_> {
             Err(e) => return self.read_failed(e, &supervisor),
         };
         let stale = match self.fresh_or_stale(value) {
-            ControlFlow::Break(fresh) => {
+            ControlFlow::Break((fresh, age_ms)) => {
                 if let Some(code) = supervisor.interrupted() {
                     return Ok(code);
                 }
                 emit(&fresh);
-                return Ok(0);
+                return Ok(self.done("served fresh", Some(age_ms), 0));
             }
             ControlFlow::Continue(stale) => stale,
         };
@@ -158,7 +165,7 @@ impl Call<'_> {
                 m.exit,
                 human(m.retry_at_ms - now)
             ));
-            return Ok(m.exit);
+            return Ok(self.done("suppressed", None, m.exit));
         }
 
         let code = self.record(&supervisor, stale, marker);
@@ -180,6 +187,13 @@ impl Call<'_> {
     /// Run the command and record the outcome: the value on success, the
     /// bumped marker on failure. `marker` is the current one, if any.
     fn record(&self, supervisor: &Supervisor, stale: Option<Stale>, marker: Option<Marker>) -> i32 {
+        let age_ms = stale.as_ref().map(|s| s.age_ms);
+        let ran = if self.args.refresh {
+            "refreshed"
+        } else {
+            "ran"
+        };
+        let not_stored = format!("{ran}, not stored");
         let (code, stdout) = match supervisor.run(&self.args.command, Some(self.store.max_output()))
         {
             Ran::SpawnFailed { code } => {
@@ -188,7 +202,7 @@ impl Call<'_> {
                 // turned a received signal into `Interrupted`.
                 return match stale {
                     Some(stale) => self.serve_stale(&stale, None, None, None),
-                    None => code,
+                    None => self.done(NOT_STARTED, None, code),
                 };
             }
             Ran::Interrupted { signal } => return 128 + signal,
@@ -199,7 +213,7 @@ impl Call<'_> {
                     }
                     (_, stdout) => {
                         stdout.emit_captured();
-                        126
+                        self.done(&not_stored, age_ms, 126)
                     }
                 };
             }
@@ -223,6 +237,10 @@ impl Call<'_> {
                 envelope.as_deref().map(|e| (e, ttl)),
                 &self.marker_key,
             );
+            let outcome = match (&envelope, &stored) {
+                (Some(_), Ok(())) => format!("{ran} and stored"),
+                _ => not_stored,
+            };
             // One warning: a failed write and a failed clear usually share a cause.
             match (stored, cleared) {
                 (Err(e), Err(_)) => warn(&format!(
@@ -235,13 +253,13 @@ impl Call<'_> {
                 (Ok(()), Err(e)) => warn(&format!("cannot clear the recorded failure: {e}")),
                 (Ok(()), Ok(())) => {}
             }
-            return 0;
+            return self.done(&outcome, age_ms, 0);
         }
 
         if matches!(stdout, Stdout::OutputLost) {
             // ck's stdout failed mid-stream and the command most likely died
             // of SIGPIPE: no evidence about the origin, so no marker.
-            return code;
+            return self.done(&not_stored, age_ms, code);
         }
         let next = Marker::bumped(marker.as_ref(), code, now);
         if let Err(e) = self
@@ -256,19 +274,26 @@ impl Call<'_> {
             }
             (stdout, _) => {
                 stdout.emit_captured();
-                code
+                self.done(&not_stored, age_ms, code)
             }
         }
     }
 
-    /// Break with a fresh value to print, or continue with the stale run (if
-    /// `--stale` still allows one) for the caller to fall back on.
-    fn fresh_or_stale(&self, value: Option<Envelope>) -> ControlFlow<Vec<u8>, Option<Stale>> {
+    /// Break with a fresh value to print and its age, or continue with the
+    /// stale run (if `--stale` still allows one) for the caller to fall back on.
+    fn fresh_or_stale(
+        &self,
+        value: Option<Envelope>,
+    ) -> ControlFlow<(Vec<u8>, u64), Option<Stale>> {
         let Some(envelope) = value else {
             return ControlFlow::Continue(None);
         };
-        match envelope.freshness(now_ms(), self.args.ttl_secs, self.args.stale_secs) {
-            Freshness::Fresh => ControlFlow::Break(envelope.stdout),
+        let now = now_ms();
+        match envelope.freshness(now, self.args.ttl_secs, self.args.stale_secs) {
+            Freshness::Fresh => {
+                let age_ms = now.saturating_sub(envelope.stored_at_ms);
+                ControlFlow::Break((envelope.stdout, age_ms))
+            }
             Freshness::Stale { age_ms } => ControlFlow::Continue(Some(Stale { envelope, age_ms })),
             Freshness::Expired => ControlFlow::Continue(None),
         }
@@ -302,7 +327,7 @@ impl Call<'_> {
         }
         warn(&line);
         emit(&stale.envelope.stdout);
-        0
+        self.done("served stale", Some(stale.age_ms), 0)
     }
 
     /// Any backend error before the run disables caching for this call, never
@@ -312,19 +337,52 @@ impl Call<'_> {
             ReadError::Local(fatal) => Err(fatal),
             ReadError::Backend(e) => {
                 warn(&format!("the cache is unavailable ({e}); running uncached"));
-                Ok(run_uncached(supervisor, &self.args.command))
+                Ok(self.run_uncached(supervisor))
             }
         }
     }
-}
 
-fn run_uncached(supervisor: &Supervisor, argv: &[std::ffi::OsString]) -> i32 {
-    match supervisor.run(argv, None) {
-        Ran::SpawnFailed { code } | Ran::Exited { code, .. } => code,
-        Ran::StatusUnknown { .. } => 126,
-        Ran::Interrupted { signal } => 128 + signal,
+    fn run_uncached(&self, supervisor: &Supervisor) -> i32 {
+        match supervisor.run(&self.args.command, None) {
+            Ran::SpawnFailed { code } => self.done(NOT_STARTED, None, code),
+            Ran::Exited { code, .. } => self.done("ran uncached", None, code),
+            Ran::StatusUnknown { .. } => self.done("ran uncached", None, 126),
+            Ran::Interrupted { signal } => 128 + signal,
+        }
+    }
+
+    /// Return `code`, first saying on stderr what the call did when
+    /// `CK_LOG=debug`. Every outcome passes through here exactly once; an
+    /// interrupted run or a ck error does not.
+    ///
+    /// The line names only the program: its arguments, its output and both
+    /// keys can carry secrets. The entry id is the start of the keyed hash
+    /// that names the fill lock, so a guessed command line cannot be checked
+    /// against it without the master key.
+    fn done(&self, outcome: &str, age_ms: Option<u64>, code: i32) -> i32 {
+        if !self.debug {
+            return code;
+        }
+        let backend = match self.args.backend {
+            BackendKind::File => "file",
+            BackendKind::Saas => "saas",
+        };
+        // Debug-quoted, so control characters cannot drive the terminal.
+        let program = self.args.command[0].to_string_lossy();
+        let entry = &keys::key_hash(&self.key)[..ENTRY_ID_LEN];
+        let age = age_ms.map_or(String::new(), |ms| format!(" age={ms}ms"));
+        debug(&format!(
+            "{outcome}: backend={backend} program={program:?} entry={entry}{age} exit={code} elapsed={}ms",
+            self.started.elapsed().as_millis()
+        ));
+        code
     }
 }
+
+/// Hex characters of the key hash that identify an entry in a debug line.
+const ENTRY_ID_LEN: usize = 12;
+
+const NOT_STARTED: &str = "could not start the command";
 
 /// Take the fill lock, an exclusive `flock` on the key's lockfile. When it is
 /// contended, wait for it only if `wait`; otherwise return `None`. flock is

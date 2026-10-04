@@ -86,6 +86,11 @@ const CASES: &[(&str, fn())] = &[
     ),
     ("readme_saas_examples_run", readme_saas_examples_run),
     (
+        "ck_log_reports_a_fault_and_the_size_cap",
+        ck_log_reports_a_fault_and_the_size_cap,
+    ),
+    ("ck_log_prints_no_secret", ck_log_prints_no_secret),
+    (
         "the_harness_reads_libtest_options",
         the_harness_reads_libtest_options,
     ),
@@ -781,6 +786,106 @@ fn a_contended_lock_serves_stale_in_one_line() {
     assert!(warnings[0].contains("serving output from"), "{warnings:?}");
     assert!(warnings[0].contains("HTTP 503"), "{warnings:?}");
     assert_eq!(stdout(&filler.wait_with_output().unwrap()), "new\n");
+}
+
+/// The call's one `ck: debug:` line, checked to name `outcome` on saas.
+fn debug_line(out: &Output, outcome: &str) -> String {
+    let debug: Vec<String> = lines(out)
+        .into_iter()
+        .filter(|l| l.starts_with("ck: debug: "))
+        .collect();
+    assert_eq!(debug.len(), 1, "{}", stderr(out));
+    let prefix = format!("ck: debug: {outcome}: backend=saas ");
+    assert!(debug[0].starts_with(&prefix), "want {outcome:?}: {debug:?}");
+    debug[0].clone()
+}
+
+fn ck_log_reports_a_fault_and_the_size_cap() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let service = Service::new();
+    let host = Sandbox::new();
+    let out = service
+        .ck(&host, &[])
+        .env("CK_LOG", "debug")
+        .env(FAULT, "get=503")
+        .output()
+        .unwrap();
+    assert_eq!(code(&out), 0);
+    assert!(stderr(&out).starts_with("ck: the cache is unavailable"));
+    debug_line(&out, "ran uncached");
+
+    let origin = host.bin().join("origin");
+    fs::write(
+        &origin,
+        "#!/bin/sh\nhead -c 1052672 /dev/zero | tr '\\0' x\n",
+    )
+    .unwrap();
+    fs::set_permissions(&origin, fs::Permissions::from_mode(0o755)).unwrap();
+    let out = service
+        .ck(&host, &[])
+        .env("CK_LOG", "debug")
+        .output()
+        .unwrap();
+    assert_eq!((code(&out), out.stdout.len()), (0, 1_052_672));
+    assert!(stderr(&out).contains("passed 1 MiB"), "{}", stderr(&out));
+    debug_line(&out, "ran, not stored");
+}
+
+/// No path's debug line carries the command's arguments, its output, or
+/// either key. Each sentinel would show up on stderr if one did.
+fn ck_log_prints_no_secret() {
+    const ARG: &str = "sentinel-argument-4f1c";
+    const OUT: &str = "sentinel-output-4f1c";
+    const API_KEY: &str = "ck_sdk_sentinel-api-key-4f1c";
+    let master_key = "4f1c".repeat(16);
+
+    let service = Service::new();
+    let host = Sandbox::new();
+    host.set("out", &format!("{OUT}\n"));
+    let call = |fault: Option<&str>| {
+        let args = [
+            "run",
+            "--backend",
+            "saas",
+            "--ttl",
+            "1s",
+            "--stale",
+            "1h",
+            "--",
+            "origin",
+            "--token",
+            ARG,
+        ];
+        let mut cmd = service.bare(&host, &args);
+        cmd.env("CACHEKIT_API_KEY", API_KEY)
+            .env("CACHEKIT_MASTER_KEY", &master_key)
+            .env("CK_LOG", "debug");
+        if let Some(fault) = fault {
+            cmd.env(FAULT, fault);
+        }
+        cmd.output().unwrap()
+    };
+    let check = |out: &Output, outcome: &str| {
+        assert_eq!(stdout(out), format!("{OUT}\n"));
+        for secret in [ARG, OUT, API_KEY, master_key.as_str()] {
+            assert!(
+                !stderr(out).contains(secret),
+                "{secret:?} on stderr: {}",
+                stderr(out)
+            );
+        }
+        let line = debug_line(out, outcome);
+        assert!(line.contains("program=\"origin\""), "{line}");
+    };
+
+    check(&call(None), "ran and stored");
+    check(&call(None), "served fresh");
+    std::thread::sleep(Duration::from_millis(1_100));
+    host.set("exit", "1");
+    check(&call(None), "served stale");
+    host.set("exit", "0");
+    check(&call(Some("get=401")), "ran uncached");
 }
 
 fn the_harness_reads_libtest_options() {

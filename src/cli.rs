@@ -24,7 +24,9 @@ stdin, never ck's: pass input in arguments, files or --scope.
   --scope S       an extra string folded into the cache key
   --refresh       run the command now, ignoring any stored output
 
-D is a whole number followed by s, m, h or d, such as 90s, 15m, 12h or 7d.";
+D is a whole number followed by s, m, h or d, such as 90s, 15m, 12h or 7d.
+
+Set CK_LOG=debug to print one line per call on stderr saying what ck did.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
