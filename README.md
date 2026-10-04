@@ -49,7 +49,7 @@ is not repeated. A typical use is a secret read in a shell startup file, where
 every new shell would otherwise call the secret manager again:
 
 ```sh
-API_TOKEN="$(ck run --ttl 12h --stale 7d -- op read op://Private/api/token)"
+API_TOKEN="$(ck run --ttl 12h --stale 7d -- op item get api --fields token --reveal)"
 export API_TOKEN
 ```
 
@@ -277,6 +277,13 @@ ignored too.
 Linux and macOS. The cache directory must be on a local filesystem: on NFS or
 SMB, concurrent first calls may each run the command, though entries are never
 torn.
+
+## Contributing
+
+User-facing docs in this repository follow CacheKit's shared rule on what belongs in them:
+[What belongs in these docs](https://docs.cachekit.io/contributing/#what-belongs-in-these-docs).
+`prek install` (or `pre-commit install`) sets up hooks that reject internal references in README
+files, `docs/` and commit messages.
 
 ## License
 
