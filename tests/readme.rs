@@ -43,6 +43,7 @@ fn readme_examples_run() {
         let out = Command::new("sh")
             .args(["-euc", &example])
             .env("HOME", s.home())
+            .env_remove("CK_LOG")
             .env("PATH", path)
             // A pipe, as in CI, not /dev/null: the examples carry no redirect.
             .stdin(Stdio::piped())

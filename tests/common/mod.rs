@@ -81,8 +81,8 @@ impl Sandbox {
     }
 
     /// `ck <args>` in this sandbox, in its own process group, with stdin on
-    /// /dev/null and no CacheKit variables inherited from the machine running
-    /// the tests.
+    /// /dev/null and no CacheKit variables or `CK_LOG` inherited from the
+    /// machine running the tests.
     pub fn ck(&self, args: &[&str]) -> Command {
         self.command(Path::new(BIN), args)
     }
@@ -103,7 +103,8 @@ impl Sandbox {
         let path = std::env::var_os("PATH").unwrap_or_default();
         let mut paths = vec![self.bin()];
         paths.extend(std::env::split_paths(&path));
-        cmd.env("HOME", self.home())
+        cmd.env_remove("CK_LOG")
+            .env("HOME", self.home())
             .env("PATH", std::env::join_paths(paths).unwrap())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

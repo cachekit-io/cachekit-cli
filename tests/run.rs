@@ -1094,3 +1094,154 @@ fn a_signal_while_serving_stale_output_stops_ck() {
     let _ = filler.kill();
     let _ = filler.wait();
 }
+
+// ── CK_LOG ───────────────────────────────────────────────────────────────────
+
+/// `ck run <flags> -- <command>` with `CK_LOG=debug`.
+fn logged(s: &Sandbox, flags: &[&str], command: &[&str]) -> std::process::Output {
+    let mut args = vec!["run"];
+    args.extend_from_slice(flags);
+    args.push("--");
+    args.extend_from_slice(command);
+    s.ck(&args).env("CK_LOG", "debug").output().unwrap()
+}
+
+/// The call's one debug line, checked to name `outcome`.
+fn debug_line(out: &std::process::Output, outcome: &str) -> String {
+    let err = stderr(out);
+    let lines: Vec<&str> = err
+        .lines()
+        .filter(|l| l.starts_with("ck: debug: "))
+        .collect();
+    assert_eq!(lines.len(), 1, "{err}");
+    let prefix = format!("ck: debug: {outcome}: ");
+    assert!(lines[0].starts_with(&prefix), "want {outcome:?}: {err}");
+    lines[0].to_owned()
+}
+
+/// The value of `name=` in a debug line.
+fn field<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+    line.split(' ')
+        .find_map(|f| f.strip_prefix(name)?.strip_prefix('='))
+}
+
+#[test]
+fn ck_log_debug_reports_each_outcome() {
+    let s = Sandbox::new();
+    let flags = ["--ttl", "1s", "--stale", "1h"];
+    let line = debug_line(&logged(&s, &flags, &["origin"]), "ran and stored");
+    assert_eq!(field(&line, "age"), None, "{line}");
+    assert_eq!(field(&line, "exit"), Some("0"), "{line}");
+    let out = logged(&s, &flags, &["origin"]);
+    assert_eq!(stderr(&out).lines().count(), 1, "{}", stderr(&out));
+    debug_line(&out, "served fresh");
+
+    sleep(PAST_TTL);
+    s.set("exit", "1");
+    let out = logged(&s, &flags, &["origin"]);
+    assert_eq!((code(&out), stdout(&out)), (0, "hello\n".into()));
+    // The existing warning, then the debug line.
+    let err = stderr(&out);
+    assert!(
+        err.starts_with("ck: the command exited 1; serving"),
+        "{err}"
+    );
+    assert_eq!(err.lines().count(), 2, "{err}");
+    let line = debug_line(&out, "served stale");
+    assert!(field(&line, "age").is_some(), "{line}");
+
+    // Another entry, with nothing stored to fall back on.
+    let other = ["--scope", "other"];
+    let line = debug_line(&logged(&s, &other, &["origin"]), "ran, not stored");
+    assert_eq!(field(&line, "exit"), Some("1"), "{line}");
+    let line = debug_line(&logged(&s, &other, &["origin"]), "suppressed");
+    assert_eq!(field(&line, "exit"), Some("1"), "{line}");
+    s.set("exit", "0");
+    let refresh = ["--scope", "other", "--refresh"];
+    debug_line(&logged(&s, &refresh, &["origin"]), "refreshed and stored");
+    s.set("exit", "2");
+    debug_line(&logged(&s, &refresh, &["origin"]), "refreshed, not stored");
+
+    let out = logged(&s, &[], &["ck-test-not-installed"]);
+    assert_eq!(code(&out), 127);
+    let line = debug_line(&out, "could not start the command");
+    assert_eq!(field(&line, "exit"), Some("127"), "{line}");
+}
+
+#[test]
+fn a_ck_log_line_names_the_entry_by_its_lock_file() {
+    let s = Sandbox::new();
+    logged(&s, &["--ttl", "1h"], &["origin", "--flag", "value"]);
+    let line = debug_line(
+        &logged(&s, &["--ttl", "1h"], &["origin", "--flag", "value"]),
+        "served fresh",
+    );
+    assert_eq!(field(&line, "backend"), Some("file"), "{line}");
+    assert_eq!(field(&line, "program"), Some("\"origin\""), "{line}");
+    assert!(
+        !line.contains("--flag") && !line.contains("value"),
+        "{line}"
+    );
+    let age: u64 = field(&line, "age")
+        .unwrap()
+        .strip_suffix("ms")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(age < 60_000, "{line}");
+    let elapsed = field(&line, "elapsed").unwrap();
+    assert!(
+        elapsed.strip_suffix("ms").unwrap().parse::<u64>().is_ok(),
+        "{line}"
+    );
+
+    let entry = field(&line, "entry").unwrap();
+    assert_eq!(entry.len(), 12, "{line}");
+    assert!(entry.bytes().all(|b| b.is_ascii_hexdigit()), "{line}");
+    let locks = entries(&s.home().join(".cache/ck/locks"));
+    assert_eq!(locks.len(), 1, "{locks:?}");
+    assert!(locks[0].starts_with(entry), "{entry} is not {locks:?}");
+}
+
+#[test]
+fn ck_log_leaves_a_hits_stdout_alone() {
+    let s = Sandbox::new();
+    s.set("out", "a\tb\n\nno trailing newline");
+    assert_eq!(code(&s.run(&["--ttl", "1h"])), 0);
+    let plain = s.run(&["--ttl", "1h"]);
+    let logged = logged(&s, &["--ttl", "1h"], &["origin"]);
+    assert_eq!(plain.stdout, logged.stdout);
+    assert_eq!((code(&plain), code(&logged)), (0, 0));
+    assert_eq!(s.runs(), 1);
+}
+
+#[test]
+fn a_bad_ck_log_warns_and_runs_the_command() {
+    for value in ["DEBUG", "1", "trace", "debug ", "verbose"] {
+        let s = Sandbox::new();
+        s.set("exit", "3");
+        let out = s
+            .ck(&["run", "--", "origin"])
+            .env("CK_LOG", value)
+            .output()
+            .unwrap();
+        assert_eq!((code(&out), stdout(&out)), (3, "hello\n".into()), "{value}");
+        assert_eq!(
+            stderr(&out),
+            "ck: ignoring CK_LOG: the only accepted value is debug\n",
+            "{value}"
+        );
+        assert_eq!(s.runs(), 1);
+    }
+
+    let s = Sandbox::new();
+    let out = s
+        .ck(&["run", "--", "origin"])
+        .env("CK_LOG", "")
+        .output()
+        .unwrap();
+    assert_eq!(
+        (code(&out), stdout(&out), stderr(&out)),
+        (0, "hello\n".into(), String::new())
+    );
+}
