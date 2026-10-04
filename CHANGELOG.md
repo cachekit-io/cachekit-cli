@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/cachekit-io/cachekit-cli/compare/v0.1.0...v0.2.0) (2026-10-04)
+
+
+### Features
+
+* **run:** CK_LOG=debug prints one stderr line per call (LAB-8070) ([#17](https://github.com/cachekit-io/cachekit-cli/issues/17)) ([04c27d3](https://github.com/cachekit-io/cachekit-cli/commit/04c27d3266aceaa742fc22ac4b91e0f2333ff9a5))
+
 ## 0.1.0 (2026-10-03)
 
 
