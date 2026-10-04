@@ -3,21 +3,18 @@ default_install_hook_types: [pre-commit, commit-msg]
 
 repos:
   # Keeps internal references (ticket ids, secret-store paths, internal hosts and process
-  # names) out of user-facing docs and commit messages. The patterns are generic on purpose:
-  # a list of specific internal names would itself disclose them.
-  # Scope rule: https://docs.cachekit.io/contributing/#what-belongs-in-these-docs
+  # names) out of user-facing docs and commit messages. The patterns live in the script.
   - repo: local
     hooks:
       - id: no-internal-references
         name: No internal references in docs
-        language: pygrep
-        entry: 'LAB-[0-9]+|op://|\.ts\.net|(?i:k3s cluster)|dev\.cachekit\.io|\bStage [0-9]|\bAC-[0-9]|github\.com/cachekit(?![\w-])'
+        language: python
+        entry: python scripts/no_internal_references.py
         files: ^((packages|crates)/[^/]+/)?README[^/]*$|^docs/
         types: [text]
         stages: [pre-commit]
       - id: no-internal-references-commit-msg
         name: No internal references in commit message
-        language: pygrep
-        # Same patterns, skipping git's "#" comment lines and "Merge" subjects, which quote branch names.
-        entry: '^(?!#|Merge ).*?(?:LAB-[0-9]+|op://|\.ts\.net|(?i:k3s cluster)|dev\.cachekit\.io|\bStage [0-9]|\bAC-[0-9]|github\.com/cachekit(?![\w-]))'
+        language: python
+        entry: python scripts/no_internal_references.py --commit-msg
         stages: [commit-msg]
