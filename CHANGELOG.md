@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.1](https://github.com/cachekit-io/cachekit-cli/compare/v0.2.0...v0.2.1) (2026-10-21)
+
+
+### Bug Fixes
+
+* **deps:** update rustls, rustls-webpki and webpki-roots for RustSec advisories ([259e1f8](https://github.com/cachekit-io/cachekit-cli/commit/259e1f8e791114302b47a68b7e4b7f71c3ea967c))
+* **deps:** update rustls, rustls-webpki and webpki-roots for RustSec advisories (LAB-10248) ([6c44481](https://github.com/cachekit-io/cachekit-cli/commit/6c444819b8b9de230f578c1c2961de296f7dd390))
+
 ## [0.2.0](https://github.com/cachekit-io/cachekit-cli/compare/v0.1.0...v0.2.0) (2026-10-04)
 
 
