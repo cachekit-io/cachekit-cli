@@ -281,10 +281,12 @@ mod tests {
     use super::*;
 
     /// The key from `keys::tests::value_key_known_answer`.
-    const OLD_KEY: &str =
+    const KNOWN_ANSWER_KEY: &str =
         "ns:ck-run:v1:041385329ef05862f32fad778ee6c2a69581637fd18926b3b0e8819aee6662ec";
-    /// `EncryptionLayer::encrypt(b"ck known answer", OLD_KEY)` with master key
-    /// `[7; 32]`, on cachekit-rs 0.9.0 and cachekit-core 0.6.0.
+    /// The master key `OLD_CIPHERTEXT` was written under.
+    const OLD_MASTER_KEY: [u8; 32] = [7; 32];
+    /// `EncryptionLayer::encrypt(b"ck known answer", KNOWN_ANSWER_KEY)` under
+    /// `OLD_MASTER_KEY`, on cachekit-rs 0.9.0 and cachekit-core 0.6.0.
     const OLD_CIPHERTEXT: &str =
         "c90083142ccd441f0000000081198d2ce5728477cfab8528cb949c6393c0eeecc2dce5218b717e7fb3ea36";
 
@@ -293,28 +295,28 @@ mod tests {
     /// plaintext is a fixed string, not an `Envelope`.
     #[test]
     fn an_older_entry_still_decrypts() {
-        let layer = EncryptionLayer::new(&[7u8; 32], TENANT).unwrap();
+        let layer = EncryptionLayer::new(&OLD_MASTER_KEY, TENANT).unwrap();
         let ciphertext = hex::decode(OLD_CIPHERTEXT).unwrap();
         assert_eq!(
-            layer.decrypt(&ciphertext, OLD_KEY).unwrap(),
+            layer.decrypt(&ciphertext, KNOWN_ANSWER_KEY).unwrap(),
             b"ck known answer"
         );
     }
 
-    /// The frozen encryption format, rebuilt from the protocol spec on
-    /// RustCrypto alone. Neither cachekit-rs nor cachekit-core derives the key
-    /// or opens the ciphertext here, so a change to their writer cannot carry
-    /// this reader along with it.
+    /// The subset of the frozen encryption format that ck writes, rebuilt
+    /// from the protocol spec on RustCrypto alone. Neither cachekit-rs nor
+    /// cachekit-core derives the key or opens the ciphertext here, so a change
+    /// to their writer cannot carry this reader along with it.
     mod frozen {
         use aes_gcm::aead::{Aead, KeyInit, Payload};
         use aes_gcm::{Aes256Gcm, Nonce};
         use hkdf::Hkdf;
-        use sha2::{Digest, Sha256};
+        use sha2::Sha256;
 
         /// HKDF-SHA256 for the `encryption` domain. The salt is
         /// `"cachekit_v1_" ‖ u8 len ‖ domain ‖ u16be len ‖ tenant`, and the
         /// info is the domain.
-        pub fn key(master_key: &[u8], tenant: &str) -> [u8; 32] {
+        fn key(master_key: &[u8], tenant: &str) -> [u8; 32] {
             let domain = b"encryption";
             let mut salt = b"cachekit_v1_".to_vec();
             salt.push(domain.len() as u8);
@@ -328,18 +330,9 @@ mod tests {
             key
         }
 
-        /// The protocol's key fingerprint: the first 16 bytes of
-        /// SHA-256(`"key_fingerprint_v1"` ‖ key).
-        pub fn fingerprint(key: &[u8]) -> Vec<u8> {
-            Sha256::new()
-                .chain_update(b"key_fingerprint_v1")
-                .chain_update(key)
-                .finalize()[..16]
-                .to_vec()
-        }
-
-        /// AAD v0x03 for an uncompressed msgpack entry: `0x03`, then tenant,
-        /// cache key, `"msgpack"` and `"False"`, each after a u32be length.
+        /// The four-part v0x03 AAD ck writes, for an uncompressed msgpack
+        /// entry: `0x03`, then tenant, cache key, `"msgpack"` and `"False"`,
+        /// each after a u32be length.
         pub fn aad(tenant: &str, cache_key: &str) -> Vec<u8> {
             let mut aad = vec![0x03];
             for part in [
@@ -355,7 +348,7 @@ mod tests {
         }
 
         /// Opens `nonce(12) ‖ ciphertext ‖ tag(16)`, with nothing before or
-        /// after it.
+        /// after it, under the AAD ck writes.
         pub fn open(
             master_key: &[u8],
             tenant: &str,
@@ -386,10 +379,6 @@ mod tests {
         let master_key = [0x61u8; 32];
         let tenant = "cross-sdk-test";
         assert_eq!(
-            hex::encode(frozen::fingerprint(&frozen::key(&master_key, tenant))),
-            "96179a9bc881aa7ca83f04b78a66afd3"
-        );
-        assert_eq!(
             hex::encode(frozen::aad(tenant, "test:vector:1")),
             "030000000e63726f73732d73646b2d746573740000000d746573743a766563746f723a31\
              000000076d73677061636b0000000546616c7365"
@@ -403,18 +392,20 @@ mod tests {
         );
         let ciphertext = hex::decode(OLD_CIPHERTEXT).unwrap();
         assert_eq!(
-            frozen::open(&[7u8; 32], TENANT, OLD_KEY, &ciphertext).as_deref(),
+            frozen::open(&OLD_MASTER_KEY, TENANT, KNOWN_ANSWER_KEY, &ciphertext).as_deref(),
             Some(&b"ck known answer"[..])
         );
     }
 
-    /// What ck writes now is readable under the frozen format, so an older ck
-    /// sharing the backend still gets a hit. This catches a writer change that
-    /// the same release's reader accepts, which `an_older_entry_still_decrypts`
-    /// cannot: the bytes checked are the ones ck hands to the backend.
+    /// The bytes ck's `put` hands to the backend open under the frozen
+    /// encryption format. This catches a writer change that the same release's
+    /// reader accepts, which `an_older_entry_still_decrypts` cannot. A small
+    /// value and a large, compressible one (the saas capture cap's worth of
+    /// zeros) are both checked, so a writer branch gated on size, such as
+    /// compression past a threshold, cannot pass unseen.
     #[test]
     fn what_ck_writes_the_frozen_format_reads() {
-        let master_key = [7u8; 32];
+        let master_key = [9u8; 32];
         let dir = tempfile::tempdir().unwrap();
         // The file backend refuses a group- or other-writable directory, and
         // the tempdir's mode follows the umask.
@@ -424,19 +415,26 @@ mod tests {
         )
         .unwrap();
         let store = Store::open_file(dir.path(), &master_key).unwrap();
-        let plaintext = crate::entry::Envelope::encode(1, b"ck known answer");
-        store
-            .set(OLD_KEY, &plaintext, Duration::from_secs(60))
-            .unwrap();
-        let stored = store
-            .runtime
-            .block_on(store.backend.get(OLD_KEY))
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            frozen::open(&master_key, TENANT, OLD_KEY, &stored),
-            Some(plaintext)
-        );
+        for stdout in [b"ck known answer".to_vec(), vec![0; SAAS_MAX_OUTPUT]] {
+            let plaintext = Envelope::encode(1, &stdout);
+            store
+                .set(KNOWN_ANSWER_KEY, &plaintext, Duration::from_secs(60))
+                .unwrap();
+            let stored = store
+                .runtime
+                .block_on(store.backend.get(KNOWN_ANSWER_KEY))
+                .unwrap()
+                .unwrap();
+            let opened = frozen::open(&master_key, TENANT, KNOWN_ANSWER_KEY, &stored);
+            assert!(
+                opened.as_ref() == Some(&plaintext),
+                "a {}-byte envelope was stored as {} bytes that the frozen format does not open \
+                 to it; they start {}",
+                plaintext.len(),
+                stored.len(),
+                hex::encode(&stored[..stored.len().min(32)])
+            );
+        }
     }
 
     #[test]
