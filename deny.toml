@@ -15,7 +15,14 @@ wildcards = "deny"
 # ck has no HTTP client of its own: every network call goes through
 # cachekit-rs, whose request paths are fixed. A direct HTTP client
 # dependency fails here.
-deny = [{ crate = "reqwest", wrappers = ["cachekit-rs"] }]
+#
+# ck derives its cache-key hash key from cachekit-core and encrypts through
+# cachekit-rs's EncryptionLayer. Two cachekit-core versions would let those
+# drift apart and still build.
+deny = [
+    { crate = "reqwest", wrappers = ["cachekit-rs"] },
+    { crate = "cachekit-core", deny-multiple-versions = true },
+]
 
 [sources]
 unknown-registry = "deny"
