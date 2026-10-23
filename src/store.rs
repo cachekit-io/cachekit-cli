@@ -14,7 +14,7 @@ use crate::keys::TENANT;
 use crate::{warn, Fatal};
 
 /// Each saas round trip gets this long. The cachekit-rs client's own
-/// timeouts (30 s per request, 10 s to connect) cannot be changed.
+/// timeouts run to several seconds and cannot be changed.
 pub(crate) const SAAS_DEADLINE: Duration = Duration::from_secs(1);
 
 /// The saas capture cap. The deadline covers the download too, so an entry
@@ -279,6 +279,20 @@ impl Drop for Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An entry an earlier ck wrote still decrypts. The ciphertext came from
+    /// cachekit-rs 0.9.0 with cachekit-core 0.6.0, master key `[7; 32]`, under
+    /// the key from `keys::tests::value_key_known_answer`.
+    #[test]
+    fn an_older_entry_still_decrypts() {
+        let key = "ns:ck-run:v1:041385329ef05862f32fad778ee6c2a69581637fd18926b3b0e8819aee6662ec";
+        let ciphertext = hex::decode(
+            "c90083142ccd441f0000000081198d2ce5728477cfab8528cb949c6393c0eeecc2dce5218b717e7fb3ea36",
+        )
+        .unwrap();
+        let layer = EncryptionLayer::new(&[7u8; 32], TENANT).unwrap();
+        assert_eq!(layer.decrypt(&ciphertext, key).unwrap(), b"ck known answer");
+    }
 
     #[test]
     fn an_authentication_error_names_the_fix() {

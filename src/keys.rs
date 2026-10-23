@@ -231,6 +231,16 @@ mod tests {
         }
     }
 
+    /// A known answer. A dependency bump that changes the key derivation
+    /// fails here, instead of turning every stored entry into a silent miss.
+    #[test]
+    fn value_key_known_answer() {
+        assert_eq!(
+            hasher().value_key(&"".into(), &os(&["op", "read"])),
+            "ns:ck-run:v1:041385329ef05862f32fad778ee6c2a69581637fd18926b3b0e8819aee6662ec"
+        );
+    }
+
     #[test]
     fn different_master_keys_give_disjoint_keys() {
         let other = KeyHasher::new(&[8u8; 32]).unwrap();
