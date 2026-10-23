@@ -280,18 +280,163 @@ impl Drop for Runtime {
 mod tests {
     use super::*;
 
-    /// An entry an earlier ck wrote still decrypts. The ciphertext came from
-    /// cachekit-rs 0.9.0 with cachekit-core 0.6.0, master key `[7; 32]`, under
-    /// the key from `keys::tests::value_key_known_answer`.
+    /// The key from `keys::tests::value_key_known_answer`.
+    const OLD_KEY: &str =
+        "ns:ck-run:v1:041385329ef05862f32fad778ee6c2a69581637fd18926b3b0e8819aee6662ec";
+    /// `EncryptionLayer::encrypt(b"ck known answer", OLD_KEY)` with master key
+    /// `[7; 32]`, on cachekit-rs 0.9.0 and cachekit-core 0.6.0.
+    const OLD_CIPHERTEXT: &str =
+        "c90083142ccd441f0000000081198d2ce5728477cfab8528cb949c6393c0eeecc2dce5218b717e7fb3ea36";
+
+    /// A ciphertext from the same `EncryptionLayer` call ck makes, on
+    /// cachekit-rs 0.9.0 and cachekit-core 0.6.0, still decrypts. Its
+    /// plaintext is a fixed string, not an `Envelope`.
     #[test]
     fn an_older_entry_still_decrypts() {
-        let key = "ns:ck-run:v1:041385329ef05862f32fad778ee6c2a69581637fd18926b3b0e8819aee6662ec";
-        let ciphertext = hex::decode(
-            "c90083142ccd441f0000000081198d2ce5728477cfab8528cb949c6393c0eeecc2dce5218b717e7fb3ea36",
+        let layer = EncryptionLayer::new(&[7u8; 32], TENANT).unwrap();
+        let ciphertext = hex::decode(OLD_CIPHERTEXT).unwrap();
+        assert_eq!(
+            layer.decrypt(&ciphertext, OLD_KEY).unwrap(),
+            b"ck known answer"
+        );
+    }
+
+    /// The frozen encryption format, rebuilt from the protocol spec on
+    /// RustCrypto alone. Neither cachekit-rs nor cachekit-core derives the key
+    /// or opens the ciphertext here, so a change to their writer cannot carry
+    /// this reader along with it.
+    mod frozen {
+        use aes_gcm::aead::{Aead, KeyInit, Payload};
+        use aes_gcm::{Aes256Gcm, Nonce};
+        use hkdf::Hkdf;
+        use sha2::{Digest, Sha256};
+
+        /// HKDF-SHA256 for the `encryption` domain. The salt is
+        /// `"cachekit_v1_" ‖ u8 len ‖ domain ‖ u16be len ‖ tenant`, and the
+        /// info is the domain.
+        pub fn key(master_key: &[u8], tenant: &str) -> [u8; 32] {
+            let domain = b"encryption";
+            let mut salt = b"cachekit_v1_".to_vec();
+            salt.push(domain.len() as u8);
+            salt.extend_from_slice(domain);
+            salt.extend_from_slice(&(tenant.len() as u16).to_be_bytes());
+            salt.extend_from_slice(tenant.as_bytes());
+            let mut key = [0; 32];
+            Hkdf::<Sha256>::new(Some(&salt), master_key)
+                .expand(domain, &mut key)
+                .unwrap();
+            key
+        }
+
+        /// The protocol's key fingerprint: the first 16 bytes of
+        /// SHA-256(`"key_fingerprint_v1"` ‖ key).
+        pub fn fingerprint(key: &[u8]) -> Vec<u8> {
+            Sha256::new()
+                .chain_update(b"key_fingerprint_v1")
+                .chain_update(key)
+                .finalize()[..16]
+                .to_vec()
+        }
+
+        /// AAD v0x03 for an uncompressed msgpack entry: `0x03`, then tenant,
+        /// cache key, `"msgpack"` and `"False"`, each after a u32be length.
+        pub fn aad(tenant: &str, cache_key: &str) -> Vec<u8> {
+            let mut aad = vec![0x03];
+            for part in [
+                tenant.as_bytes(),
+                cache_key.as_bytes(),
+                b"msgpack",
+                b"False",
+            ] {
+                aad.extend_from_slice(&(part.len() as u32).to_be_bytes());
+                aad.extend_from_slice(part);
+            }
+            aad
+        }
+
+        /// Opens `nonce(12) ‖ ciphertext ‖ tag(16)`, with nothing before or
+        /// after it.
+        pub fn open(
+            master_key: &[u8],
+            tenant: &str,
+            cache_key: &str,
+            stored: &[u8],
+        ) -> Option<Vec<u8>> {
+            let (nonce, sealed) = stored.split_at_checked(12)?;
+            let aad = aad(tenant, cache_key);
+            Aes256Gcm::new_from_slice(&key(master_key, tenant))
+                .unwrap()
+                .decrypt(
+                    Nonce::from_slice(nonce),
+                    Payload {
+                        msg: sealed,
+                        aad: &aad,
+                    },
+                )
+                .ok()
+        }
+    }
+
+    /// The independent reader agrees with the protocol's published vectors
+    /// (`test-vectors/encryption.json` 1.5.0, `basic_bytes`) and with the
+    /// ciphertext an earlier cachekit-rs wrote, so it reads the frozen format
+    /// and not just whatever today's writer produces.
+    #[test]
+    fn the_frozen_reader_reads_the_protocol_vectors() {
+        let master_key = [0x61u8; 32];
+        let tenant = "cross-sdk-test";
+        assert_eq!(
+            hex::encode(frozen::fingerprint(&frozen::key(&master_key, tenant))),
+            "96179a9bc881aa7ca83f04b78a66afd3"
+        );
+        assert_eq!(
+            hex::encode(frozen::aad(tenant, "test:vector:1")),
+            "030000000e63726f73732d73646b2d746573740000000d746573743a766563746f723a31\
+             000000076d73677061636b0000000546616c7365"
+        );
+        let ciphertext =
+            hex::decode("f8f69c70000000000000000087d9ec09f2c2347a4b37d5330ccf50e3c31e69642801bef5")
+                .unwrap();
+        assert_eq!(
+            frozen::open(&master_key, tenant, "test:vector:1", &ciphertext),
+            Some(vec![1, 2, 3, 4, 5, 6, 7, 8])
+        );
+        let ciphertext = hex::decode(OLD_CIPHERTEXT).unwrap();
+        assert_eq!(
+            frozen::open(&[7u8; 32], TENANT, OLD_KEY, &ciphertext).as_deref(),
+            Some(&b"ck known answer"[..])
+        );
+    }
+
+    /// What ck writes now is readable under the frozen format, so an older ck
+    /// sharing the backend still gets a hit. This catches a writer change that
+    /// the same release's reader accepts, which `an_older_entry_still_decrypts`
+    /// cannot: the bytes checked are the ones ck hands to the backend.
+    #[test]
+    fn what_ck_writes_the_frozen_format_reads() {
+        let master_key = [7u8; 32];
+        let dir = tempfile::tempdir().unwrap();
+        // The file backend refuses a group- or other-writable directory, and
+        // the tempdir's mode follows the umask.
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
         )
         .unwrap();
-        let layer = EncryptionLayer::new(&[7u8; 32], TENANT).unwrap();
-        assert_eq!(layer.decrypt(&ciphertext, key).unwrap(), b"ck known answer");
+        let store = Store::open_file(dir.path(), &master_key).unwrap();
+        let plaintext = crate::entry::Envelope::encode(1, b"ck known answer");
+        store
+            .set(OLD_KEY, &plaintext, Duration::from_secs(60))
+            .unwrap();
+        let stored = store
+            .runtime
+            .block_on(store.backend.get(OLD_KEY))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            frozen::open(&master_key, TENANT, OLD_KEY, &stored),
+            Some(plaintext)
+        );
     }
 
     #[test]

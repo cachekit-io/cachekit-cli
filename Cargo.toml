@@ -38,6 +38,9 @@ signal-hook = "0.4"
 tokio = { version = "1", default-features = false, features = ["macros", "rt", "time"] }
 
 [dev-dependencies]
+aes-gcm = "0.10"
 async-trait = "0.1"
+hkdf = "0.12"
 rustix = { version = "1", features = ["pty"] }
+sha2 = "0.10"
 tempfile = "3"

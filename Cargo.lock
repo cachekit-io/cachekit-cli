@@ -114,14 +114,17 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 name = "cachekit-cli"
 version = "0.2.1"
 dependencies = [
+ "aes-gcm",
  "async-trait",
  "blake2",
  "cachekit-core",
  "cachekit-rs",
  "getrandom 0.2.17",
  "hex",
+ "hkdf",
  "libc",
  "rustix",
+ "sha2",
  "signal-hook",
  "tempfile",
  "tokio",
