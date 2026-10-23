@@ -370,10 +370,17 @@ mod tests {
         }
     }
 
+    /// 32 distinct bytes: the protocol's `master_key_every_hex_digit` key. A
+    /// key that repeats one byte reads the same reversed, so it cannot show a
+    /// byte-order mistake in the key's path into HKDF.
+    const MIXED_MASTER_KEY: &str =
+        "007f80ffa55ac33c1ee12dd24bb469968778f00f01102332455467768998abba";
+
     /// The independent reader agrees with the protocol's published vectors
-    /// (`test-vectors/encryption.json` 1.5.0, `basic_bytes`) and with the
-    /// ciphertext an earlier cachekit-rs wrote, so it reads the frozen format
-    /// and not just whatever today's writer produces.
+    /// (`test-vectors/encryption.json` 1.5.0, `basic_bytes` and
+    /// `master_key_every_hex_digit`) and with the ciphertext an earlier
+    /// cachekit-rs wrote, so it reads the frozen format and not just whatever
+    /// today's writer produces.
     #[test]
     fn the_frozen_reader_reads_the_protocol_vectors() {
         let master_key = [0x61u8; 32];
@@ -390,6 +397,21 @@ mod tests {
             frozen::open(&master_key, tenant, "test:vector:1", &ciphertext),
             Some(vec![1, 2, 3, 4, 5, 6, 7, 8])
         );
+        let cache_key =
+            "users:get_all:8064bf5f945dba521b017bb3f32b31a293a6e16944838d171ea9e77fab085e8e";
+        let ciphertext = hex::decode(
+            "3a3b3c3d3e3f404142434445d282555c393cc14a53d488e005e6db441d92e9fe089e97b3ecc99a86014810c745",
+        )
+        .unwrap();
+        assert_eq!(
+            frozen::open(
+                &hex::decode(MIXED_MASTER_KEY).unwrap(),
+                "default",
+                cache_key,
+                &ciphertext
+            ),
+            Some(hex::decode("9501a374776fcb400c000000000000c0c3").unwrap())
+        );
         let ciphertext = hex::decode(OLD_CIPHERTEXT).unwrap();
         assert_eq!(
             frozen::open(&OLD_MASTER_KEY, TENANT, KNOWN_ANSWER_KEY, &ciphertext).as_deref(),
@@ -399,13 +421,15 @@ mod tests {
 
     /// The bytes ck's `put` hands to the backend open under the frozen
     /// encryption format. This catches a writer change that the same release's
-    /// reader accepts, which `an_older_entry_still_decrypts` cannot. A small
-    /// value and a large, compressible one (the most output this store keeps,
-    /// as zeros) are both checked, so a writer branch gated on any size ck can
-    /// write, such as compression past a threshold, cannot pass unseen.
+    /// reader accepts, which `an_older_entry_still_decrypts` cannot. The
+    /// master key has 32 distinct bytes. Besides a short text value, it
+    /// writes compressible zeros at every power of 4 from 1 byte to 16 MiB,
+    /// and at the most output this store keeps. So a writer branch gated on
+    /// size, such as compression past a threshold, passes unseen only if its
+    /// whole range falls between two neighbouring sizes.
     #[test]
     fn what_ck_writes_the_frozen_format_reads() {
-        let master_key = [9u8; 32];
+        let master_key = hex::decode(MIXED_MASTER_KEY).unwrap();
         let dir = tempfile::tempdir().unwrap();
         // The file backend refuses a group- or other-writable directory, and
         // the tempdir's mode follows the umask.
@@ -415,7 +439,11 @@ mod tests {
         )
         .unwrap();
         let store = Store::open_file(dir.path(), &master_key).unwrap();
-        for stdout in [b"ck known answer".to_vec(), vec![0; store.max_output()]] {
+        let sizes = (0..=12)
+            .map(|k| 1 << (2 * k))
+            .chain([0, store.max_output()]);
+        let values = std::iter::once(b"ck known answer".to_vec()).chain(sizes.map(|n| vec![0; n]));
+        for stdout in values {
             let plaintext = Envelope::encode(1, &stdout);
             store
                 .set(KNOWN_ANSWER_KEY, &plaintext, Duration::from_secs(60))
