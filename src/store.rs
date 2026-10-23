@@ -400,9 +400,9 @@ mod tests {
     /// The bytes ck's `put` hands to the backend open under the frozen
     /// encryption format. This catches a writer change that the same release's
     /// reader accepts, which `an_older_entry_still_decrypts` cannot. A small
-    /// value and a large, compressible one (the saas capture cap's worth of
-    /// zeros) are both checked, so a writer branch gated on size, such as
-    /// compression past a threshold, cannot pass unseen.
+    /// value and a large, compressible one (the most output this store keeps,
+    /// as zeros) are both checked, so a writer branch gated on any size ck can
+    /// write, such as compression past a threshold, cannot pass unseen.
     #[test]
     fn what_ck_writes_the_frozen_format_reads() {
         let master_key = [9u8; 32];
@@ -415,7 +415,7 @@ mod tests {
         )
         .unwrap();
         let store = Store::open_file(dir.path(), &master_key).unwrap();
-        for stdout in [b"ck known answer".to_vec(), vec![0; SAAS_MAX_OUTPUT]] {
+        for stdout in [b"ck known answer".to_vec(), vec![0; store.max_output()]] {
             let plaintext = Envelope::encode(1, &stdout);
             store
                 .set(KNOWN_ANSWER_KEY, &plaintext, Duration::from_secs(60))
