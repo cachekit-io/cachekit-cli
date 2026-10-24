@@ -155,9 +155,9 @@ dependencies = [
 
 [[package]]
 name = "cachekit-rs"
-version = "0.11.1"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23db3fd71aa97e672e0f04be9eb62a8546fe401ac03a9f2d260d88f135f87733"
+checksum = "3b4a5b09427e5cb4da05df8ab2615e19306c62e70ac2d6be2b2cd2066cbf2ba2"
 dependencies = [
  "async-trait",
  "blake2",
@@ -289,7 +289,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -822,7 +822,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -962,7 +962,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1200,7 +1200,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
