@@ -8,7 +8,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
 use blake2::digest::consts::U32;
-use blake2::digest::Mac;
+use blake2::digest::{KeyInit, Mac};
 use blake2::Blake2bMac;
 
 use crate::Fatal;
@@ -238,6 +238,17 @@ mod tests {
         assert_eq!(
             hasher().value_key(&"".into(), &os(&["op", "read"])),
             "ns:ck-run:v1:041385329ef05862f32fad778ee6c2a69581637fd18926b3b0e8819aee6662ec"
+        );
+    }
+
+    /// The same pin over input that spans three of BLAKE2b's 128-byte blocks:
+    /// the short answer above fits in one.
+    #[test]
+    fn value_key_known_answer_multi_block() {
+        let argv = vec!["a".repeat(300).into(), "b".into()];
+        assert_eq!(
+            hasher().value_key(&"scope".into(), &argv),
+            "ns:ck-run:v1:3149e51a3ece539d69c79111aba61df0cc845f2341b6260b434cf0a69544d882"
         );
     }
 
