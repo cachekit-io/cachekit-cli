@@ -8,7 +8,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
 use blake2::digest::consts::U32;
-use blake2::digest::Mac;
+use blake2::digest::{KeyInit, Mac};
 use blake2::Blake2bMac;
 
 use crate::Fatal;
