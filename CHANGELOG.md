@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.2.2](https://github.com/cachekit-io/cachekit-cli/compare/v0.2.1...v0.2.2) (2026-10-25)
+
+
+### Bug Fixes
+
+* **deps:** update cachekit-rs to 0.11.1 and drop the cbindgen licence exception (LAB-7740) ([#23](https://github.com/cachekit-io/cachekit-cli/issues/23)) ([471e099](https://github.com/cachekit-io/cachekit-cli/commit/471e0997042c07b47ac4b0cc74c6ad2296215a6b))
+* **deps:** update tokio to 1.53.3 ([5e54a27](https://github.com/cachekit-io/cachekit-cli/commit/5e54a27e2de423a2fd69f5d7f318a92781b137d4))
+* **deps:** update tokio to 1.53.3 (LAB-10697) ([2cfd972](https://github.com/cachekit-io/cachekit-cli/commit/2cfd972ee6aa3307c5d669f5434d7311dc047842))
+
+
+### Performance Improvements
+
+* **deps:** update cachekit-core to 0.7.1 (LAB-10985) ([#30](https://github.com/cachekit-io/cachekit-cli/issues/30)) ([f959e6c](https://github.com/cachekit-io/cachekit-cli/commit/f959e6c5ce00a14d7c5539fd49b822dbb7e3fcd9))
+
 ## [0.2.1](https://github.com/cachekit-io/cachekit-cli/compare/v0.2.0...v0.2.1) (2026-10-21)
 
 
