@@ -241,6 +241,20 @@ mod tests {
         );
     }
 
+    /// The same pin over exactly 384 bytes of hashed input, three full
+    /// 128-byte BLAKE2b blocks: the answer above fits in one block, and a
+    /// whole last block is where an implementation must hold back the
+    /// final compression.
+    #[test]
+    fn value_key_known_answer_full_blocks() {
+        // 8 + 5 for the scope, 8 + 354, then 8 + 1: 384 bytes.
+        let argv = os(&[&"a".repeat(354), "b"]);
+        assert_eq!(
+            hasher().value_key(&"scope".into(), &argv),
+            "ns:ck-run:v1:1062d6accc6575abecf6c009424e1382e29774295b2cb8e63b1887a13a6e1b24"
+        );
+    }
+
     #[test]
     fn different_master_keys_give_disjoint_keys() {
         let other = KeyHasher::new(&[8u8; 32]).unwrap();
