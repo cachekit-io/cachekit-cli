@@ -112,8 +112,7 @@ fn create_file_key(dir: &Path, path: &Path) -> Result<(), Fatal> {
         .map_err(|e| fail("create the directory for", e))?;
 
     let mut secret = [0u8; 32];
-    getrandom::getrandom(&mut secret)
-        .map_err(|e| Fatal(format!("cannot generate a file key: {e}")))?;
+    getrandom::fill(&mut secret).map_err(|e| Fatal(format!("cannot generate a file key: {e}")))?;
 
     let temp = dir.join(format!(
         ".file.key.{}.{}",

@@ -119,7 +119,7 @@ dependencies = [
  "blake2",
  "cachekit-core",
  "cachekit-rs",
- "getrandom 0.2.17",
+ "getrandom 0.4.3",
  "hex",
  "hkdf",
  "libc",
