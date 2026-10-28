@@ -853,7 +853,8 @@ fn wait_until(ready: impl Fn() -> bool) {
 #[test]
 fn helper_threads_block_the_handled_signals() {
     let s = Sandbox::new();
-    s.set("sleep", "2");
+    // Outlives the 2 s re-sample below, so ck is still running throughout.
+    s.set("sleep", "5");
     let mut child = s.spawn(&["--ttl", "1h"]);
     wait_until(|| s.runs() == 1);
     let pid = child.id();
@@ -867,9 +868,22 @@ fn helper_threads_block_the_handled_signals() {
     let mut helpers = 0;
     for task in fs::read_dir(format!("/proc/{pid}/task")).unwrap() {
         let tid = task.unwrap().file_name().into_string().unwrap();
-        let mask = mask_of(&tid);
+        let mut mask = mask_of(&tid);
         if tid == pid.to_string() {
-            assert_eq!(mask & handled, 0, "the main thread blocks a handled signal");
+            // glibc's posix_spawn blocks every signal on the spawning thread
+            // until the child execs, and the command can record its run
+            // before main is scheduled again. A signal sent in that window
+            // stays pending, so only a mask that stays blocked is a fault.
+            let started = Instant::now();
+            while mask & handled != 0 && started.elapsed() < Duration::from_secs(2) {
+                sleep(Duration::from_millis(5));
+                mask = mask_of(&tid);
+            }
+            assert_eq!(
+                mask & handled,
+                0,
+                "the main thread blocks a handled signal: SigBlk {mask:016x}"
+            );
         } else {
             assert_eq!(
                 mask & handled,
