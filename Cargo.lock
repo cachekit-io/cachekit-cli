@@ -208,9 +208,9 @@ dependencies = [
 
 [[package]]
 name = "cachekit-rs"
-version = "0.11.1"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23db3fd71aa97e672e0f04be9eb62a8546fe401ac03a9f2d260d88f135f87733"
+checksum = "2e11a8596086b98f1626dfef1d66f10966ea1bc323e9fcf8bbe707568c3f5539"
 dependencies = [
  "async-trait",
  "blake2 0.10.6",

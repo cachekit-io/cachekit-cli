@@ -13,8 +13,8 @@ use crate::entry::{Envelope, Marker};
 use crate::keys::TENANT;
 use crate::{warn, Fatal};
 
-/// Each saas round trip gets this long. The cachekit-rs client's own
-/// timeouts run to several seconds and cannot be changed.
+/// Each saas round trip gets this long, enforced around the whole call,
+/// download included.
 pub(crate) const SAAS_DEADLINE: Duration = Duration::from_secs(1);
 
 /// The saas capture cap. The deadline covers the download too, so an entry
