@@ -309,7 +309,7 @@ mod tests {
     /// to their writer cannot carry this reader along with it.
     mod frozen {
         use aes_gcm::aead::{Aead, KeyInit, Payload};
-        use aes_gcm::{Aes256Gcm, Nonce};
+        use aes_gcm::Aes256Gcm;
         use hkdf::Hkdf;
         use sha2::Sha256;
 
@@ -360,7 +360,7 @@ mod tests {
             Aes256Gcm::new_from_slice(&key(master_key, tenant))
                 .unwrap()
                 .decrypt(
-                    Nonce::from_slice(nonce),
+                    nonce.try_into().ok()?,
                     Payload {
                         msg: sealed,
                         aad: &aad,
