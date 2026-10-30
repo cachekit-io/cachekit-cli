@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.3](https://github.com/cachekit-io/cachekit-cli/compare/v0.2.2...v0.2.3) (2026-10-30)
+
+
+### Bug Fixes
+
+* **deps:** update blake2 to 0.11; building needs Rust 1.87 (LAB-11170) ([#32](https://github.com/cachekit-io/cachekit-cli/issues/32)) ([f270d07](https://github.com/cachekit-io/cachekit-cli/commit/f270d07995d26b20b93810859f8c3cffd15bdd82))
+
 ## [0.2.2](https://github.com/cachekit-io/cachekit-cli/compare/v0.2.1...v0.2.2) (2026-10-25)
 
 
