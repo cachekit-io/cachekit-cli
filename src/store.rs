@@ -49,9 +49,10 @@ impl Store {
                 data_dir.display()
             ))
         })?;
-        // The file backend runs its I/O on tokio's blocking pool; a
-        // current-thread runtime with no drivers is the cheapest one that
-        // provides it, and keeps the hit path off the network stack.
+        // cachekit's `unsync` feature runs the file backend's I/O inline on
+        // this thread, so a hit starts no thread. A current-thread runtime
+        // with no drivers is the cheapest one that can drive its futures,
+        // and keeps the hit path off the network stack.
         let runtime = runtime(&mut tokio::runtime::Builder::new_current_thread())?;
         Self::new(runtime, Box::new(backend), master_key, None)
     }

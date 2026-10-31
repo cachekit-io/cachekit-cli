@@ -1,8 +1,9 @@
 //! The hit-path budget: `ck run -- true` may add at most 5 ms over `true`,
 //! against a cache directory holding about 10,000 entries.
 //!
-//! The populated directory matters: the file backend scans its whole
-//! directory each time it is opened, and nothing evicts unread entries.
+//! The populated directory is the realistic one, since nothing evicts unread
+//! entries. A hit reads one entry and never lists the directory: only a
+//! process's first write sweeps it for orphaned temp files.
 //! Ignored by default because it needs a release build to mean anything:
 //! `cargo test --release --test bench -- --ignored --nocapture`.
 

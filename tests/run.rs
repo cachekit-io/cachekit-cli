@@ -506,6 +506,46 @@ fn output_past_20_mib_is_streamed_and_not_cached() {
     }
 }
 
+/// A miss does no backend I/O while the command runs, so the output past the
+/// cap reaches the caller before the command exits, not after.
+#[test]
+fn output_past_20_mib_is_streamed_while_the_command_runs() {
+    use std::io::Read;
+
+    let s = Sandbox::new();
+    let size = 21 * 1024 * 1024;
+    let done = s.home().join("done");
+    let script = s.bin().join("big");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nhead -c {size} /dev/zero | tr '\\0' x\nsleep 3\ntouch '{}'\n",
+            done.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut child = s.ck(&["run", "--ttl", "1h", "--", "big"]).spawn().unwrap();
+    let mut pipe = child.stdout.take().unwrap();
+    let mut got = vec![0u8; size];
+    pipe.read_exact(&mut got).unwrap();
+    assert!(
+        !done.exists(),
+        "the output was held until the command exited"
+    );
+    let mut rest = Vec::new();
+    pipe.read_to_end(&mut rest).unwrap();
+    let out = child.wait_with_output().unwrap();
+
+    assert!(
+        rest.is_empty() && got.iter().all(|&b| b == b'x'),
+        "the output changed"
+    );
+    assert_eq!(code(&out), 0);
+    assert!(stderr(&out).contains("20 MiB"), "{}", stderr(&out));
+}
+
 fn signal(child: &std::process::Child, sig: rustix::process::Signal) {
     let pid = rustix::process::Pid::from_raw(child.id() as i32).unwrap();
     rustix::process::kill_process(pid, sig).unwrap();
@@ -893,8 +933,9 @@ fn helper_threads_block_the_handled_signals() {
             helpers += 1;
         }
     }
-    // The signal thread and tokio's blocking-pool thread.
-    assert!(helpers >= 2, "found {helpers} helper threads");
+    // The signal thread alone: the file backend does its I/O inline, so the
+    // reads before the run start no blocking-pool thread.
+    assert_eq!(helpers, 1, "found {helpers} helper threads");
     child.kill().unwrap();
     let _ = child.wait();
 }
