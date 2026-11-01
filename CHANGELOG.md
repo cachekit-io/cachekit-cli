@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.4](https://github.com/cachekit-io/cachekit-cli/compare/v0.2.3...v0.2.4) (2026-11-01)
+
+
+### Performance Improvements
+
+* **run:** do file-backend I/O on the main thread (LAB-12103) ([#45](https://github.com/cachekit-io/cachekit-cli/issues/45)) ([1b465d7](https://github.com/cachekit-io/cachekit-cli/commit/1b465d7718ac46ef4fe06fe6cd49b199260cdd37))
+
 ## [0.2.3](https://github.com/cachekit-io/cachekit-cli/compare/v0.2.2...v0.2.3) (2026-10-30)
 
 
