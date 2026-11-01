@@ -295,7 +295,7 @@ impl Fake {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl Backend for Fake {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError> {
         match self.answer("get", key).await {

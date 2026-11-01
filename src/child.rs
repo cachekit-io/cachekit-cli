@@ -431,10 +431,11 @@ fn forward(pid: Pid, sig: i32) {
 }
 
 /// Block [`HANDLED`] on the calling thread. ck calls this on every thread it
-/// starts (the signal thread and tokio's blocking pool), so their handlers
-/// always run on the main thread: a signal delivered to ck is recorded before
-/// the main thread's next `read` or `waitid` returns. Whether it is
-/// delivered before the child exits depends on the kernel; see
+/// starts (the signal thread, and the blocking-pool threads that run the
+/// saas backend's DNS lookups; the file backend starts none), so their
+/// handlers always run on the main thread: a signal delivered to ck is
+/// recorded before the main thread's next `read` or `waitid` returns.
+/// Whether it is delivered before the child exits depends on the kernel; see
 /// [`Supervisor::received_after`].
 pub(crate) fn block_handled_signals() {
     sigmask(libc::SIG_BLOCK, None);
