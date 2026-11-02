@@ -25,7 +25,7 @@ platform, then verify it with the [GitHub CLI](https://cli.github.com/) before
 you unpack it:
 
 ```text
-gh attestation verify ck-<version>-x86_64-unknown-linux-musl.tar.gz --repo cachekit-io/cachekit-cli \
+gh attestation verify ck-v<version>-x86_64-unknown-linux-musl.tar.gz --repo cachekit-io/cachekit-cli \
   --signer-workflow cachekit-io/cachekit-cli/.github/workflows/release.yml \
   --source-ref refs/heads/main --deny-self-hosted-runners
 ```
