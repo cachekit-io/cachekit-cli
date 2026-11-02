@@ -43,7 +43,7 @@ tokio = { version = "1", default-features = false, features = ["macros", "rt", "
 [dev-dependencies]
 aes-gcm = "0.11"
 async-trait = "0.1"
-hkdf = "0.12"
+hkdf = "0.13"
 rustix = { version = "1", features = ["pty"] }
 sha2 = "0.10"
 tempfile = "3"
