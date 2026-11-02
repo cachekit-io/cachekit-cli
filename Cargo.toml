@@ -45,5 +45,5 @@ aes-gcm = "0.11"
 async-trait = "0.1"
 hkdf = "0.12"
 rustix = { version = "1", features = ["pty"] }
-sha2 = "0.10"
+sha2 = "0.11"
 tempfile = "3"
