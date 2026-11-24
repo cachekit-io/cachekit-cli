@@ -41,7 +41,7 @@ jobs:
     # skipped job would skip every job after it.
     steps:
       # The App token, not GITHUB_TOKEN, opens the release PR, so CI runs on it.
-      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+      - uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
         if: github.event_name == 'push'
         id: app-token
         with:
@@ -228,7 +228,7 @@ jobs:
       # attaches a publisher only to an existing crate, so 0.0.0 is published
       # by hand with an API token first. Every released version comes after it,
       # because this job cannot publish a version that already exists.
-      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+      - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
         id: auth
 
       - name: Publish to crates.io
